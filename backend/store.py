@@ -96,6 +96,9 @@ class Store:
             destination_node_id TEXT NOT NULL, destination_channel INTEGER NOT NULL, source_value_type TEXT NOT NULL,
             config_json TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PLANNED'
         );
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
         """)
         migration = self.db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0
         if migration < 1:
@@ -172,6 +175,44 @@ class Store:
             self.db.execute("DROP INDEX IF EXISTS mappings_active_destination")
             self.db.execute("CREATE UNIQUE INDEX mappings_active_destination ON mappings(destination_node_id,destination_channel) WHERE enabled=1 AND armed=1")
             self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)", (utc_now(),))
+        if migration < 8:
+            for name, declaration in (
+                ("consecutive_write_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_failed_target", "REAL"),
+                ("faulted_at", "TEXT"),
+                ("failsafe_status", "TEXT NOT NULL DEFAULT 'NOT_APPLIED'"),
+                ("last_raw_ma", "REAL"),
+                ("last_calibrated_ma", "REAL"),
+                ("last_engineering_value", "REAL"),
+                ("source_quality", "TEXT"),
+                ("last_communication_at", "TEXT"),
+            ):
+                self._ensure_column("mappings", name, declaration)
+            self._ensure_column("gateways", "last_disconnect_reason", "TEXT")
+            for name, declaration in (
+                ("pipeline_id", "TEXT"),
+                ("source_node_id", "TEXT"),
+                ("source_channel", "INTEGER"),
+                ("destination_node_id", "TEXT"),
+                ("destination_channel", "INTEGER"),
+                ("classification", "TEXT"),
+            ):
+                self._ensure_column("events", name, declaration)
+            self._ensure_column("output_commands", "pipeline_id", "TEXT")
+            self._ensure_column("output_commands", "classification", "TEXT NOT NULL DEFAULT 'MANUAL'")
+            self.db.execute("CREATE INDEX IF NOT EXISTS events_pipeline_time ON events(pipeline_id,at DESC)")
+            defaults = {
+                "output_range_timeout_ms": os.getenv("OUTPUT_RANGE_TIMEOUT_MS", "5000"),
+                "output_write_timeout_ms": os.getenv("OUTPUT_WRITE_TIMEOUT_MS", "5000"),
+                "output_readback_timeout_ms": os.getenv("OUTPUT_READBACK_TIMEOUT_MS", "5000"),
+            }
+            for key, raw_value in defaults.items():
+                try:
+                    value = min(30000, max(250, int(raw_value)))
+                except (TypeError, ValueError):
+                    value = 5000
+                self.db.execute("INSERT OR IGNORE INTO system_settings(key,value,updated_at) VALUES(?,?,?)", (key,str(value),utc_now()))
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)", (utc_now(),))
         from .profiles import PROFILES
         for profile in PROFILES:
             self.db.execute("INSERT OR IGNORE INTO device_profiles(id,name,definition_json,created_at) VALUES(?,?,?,?)",
@@ -220,8 +261,16 @@ class Store:
         self.run("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",
                  (utc_now(), actor, action, entity_type, entity_id, json.dumps(detail, sort_keys=True)))
 
+    def setting(self, key: str, default=None):
+        row = self.one("SELECT value FROM system_settings WHERE key=?", (key,))
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str):
+        self.run("INSERT INTO system_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                 (key, str(value), utc_now()))
+
     def event(self, result: str, detail: str, **kwargs):
-        fields = ["gateway_id", "node_id", "direction", "protocol", "function_code", "address", "quantity", "latency_ms", "request_hex", "response_hex"]
+        fields = ["gateway_id", "node_id", "direction", "protocol", "function_code", "address", "quantity", "latency_ms", "request_hex", "response_hex", "pipeline_id", "source_node_id", "source_channel", "destination_node_id", "destination_channel", "classification"]
         values = [kwargs.get(field) for field in fields]
         self.run(f"INSERT INTO events(at,{','.join(fields)},result,detail) VALUES(?,{','.join('?' for _ in fields)},?,?)",
                  [utc_now(), *values, result, detail])

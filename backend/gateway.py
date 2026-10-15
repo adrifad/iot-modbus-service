@@ -32,6 +32,8 @@ class GatewaySession:
     peer_ip: str | None = None
     gateway_id: str | None = None
     transport_mode: str | None = None
+    identity_verified: bool = False
+    commissioning_method: str = "NONE"
     frames: asyncio.Queue = field(default_factory=asyncio.Queue)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     closed: bool = False
@@ -138,13 +140,15 @@ class GatewaySession:
         accepted = await self.on_identity(self, identity)
         return remainder if accepted and self.commissioned else b""
 
-    async def commission(self, gateway_id: str, transport_mode: str):
+    async def commission(self, gateway_id: str, transport_mode: str, *, identity_verified=False, commissioning_method="OPERATOR_ASSIGNMENT"):
         if self.closed:
             raise ConnectionError("cannot commission a closed TCP session")
         if transport_mode not in {"MODBUS_TCP", "MODBUS_RTU", "TRANSPARENT_SERIAL"}:
             raise ValueError("unsupported gateway transport mode")
         self.gateway_id = gateway_id
         self.transport_mode = transport_mode
+        self.identity_verified = identity_verified
+        self.commissioning_method = commissioning_method
         self.identity_checked = True
         self.parser = StreamFrames.create(transport_mode)
         self.state = "COMMISSIONED"
@@ -227,8 +231,11 @@ class GatewaySession:
             result = decoder(frame, transaction_id)
             return result, frame, request, latency_ms
         except asyncio.TimeoutError as exc:
+            latency_ms = (time.perf_counter() - started) * 1000
             await self._desynchronize_rtu("RTU response timed out; session closed to quarantine delayed replies")
-            raise TimeoutError("Modbus response timed out") from exc
+            error = TimeoutError("Modbus response timed out")
+            error.modbus_latency_ms = latency_ms
+            raise error from exc
         except asyncio.CancelledError:
             await self._desynchronize_rtu("RTU transaction cancelled; session closed to quarantine delayed replies")
             raise
@@ -252,7 +259,7 @@ class GatewaySession:
                 quantity=quantity, transaction_id=tx)
             return await self._wait_transaction_locked(unit_id, function_code, request, timeout_ms, decoder)
 
-    async def write_me31_output_and_readback(self, unit_id, channel, value_ma, timeout_ms):
+    async def write_me31_output_and_readback(self, unit_id, channel, value_ma, write_timeout_ms, readback_timeout_ms=None):
         """Serialize the allowlisted FC16 output write and FC03 setpoint readback."""
         if self.desynchronized:
             raise TransportDesynchronized("RTU stream is desynchronized; reconnect and recommission gateway")
@@ -266,11 +273,11 @@ class GatewaySession:
                 self.transport_mode, frame, unit_id=unit_id, address=address, quantity=2, transaction_id=tx)
             try:
                 _, ack, write_request, write_latency = await self._wait_transaction_locked(
-                    unit_id, 16, request, timeout_ms, decoder)
+                    unit_id, 16, request, write_timeout_ms, decoder)
             except Exception as exc:
                 try:
                     exc.trace = {"write_request": request, "acknowledgement": getattr(exc, "modbus_frame", None),
-                                 "write_latency_ms": None, "acknowledged": False}
+                                 "write_latency_ms": getattr(exc, "modbus_latency_ms", None), "acknowledged": False}
                 except Exception:
                     pass
                 raise
@@ -280,10 +287,12 @@ class GatewaySession:
                 self.transport_mode, frame, unit_id=unit_id, function_code=3, quantity=6, transaction_id=tx)
             try:
                 values, readback_frame, _, read_latency = await self._wait_transaction_locked(
-                    unit_id, 3, read_request, timeout_ms, read_decoder)
+                    unit_id, 3, read_request, readback_timeout_ms or write_timeout_ms, read_decoder)
             except Exception as exc:
                 raise OutputReadbackError(str(exc), {"acknowledgement": ack, "write_request": write_request,
-                    "write_latency_ms": write_latency, "readback_request": read_request, "acknowledged": True}) from exc
+                    "write_latency_ms": write_latency, "readback_request": read_request,
+                    "readback_frame": getattr(exc, "modbus_frame", None),
+                    "readback_latency_ms": getattr(exc, "modbus_latency_ms", None), "acknowledged": True}) from exc
             return {
                 "acknowledgement": ack,
                 "write_request": write_request,

@@ -31,6 +31,16 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(client.get("/api/health").status_code, 200)
                     self.assertEqual(client.get("/api/overview").status_code, 401)
                     headers = {"Authorization": f"Bearer {token}"}
+                    saved_timeouts = client.put("/api/settings/output-timeouts", headers=headers, json={
+                        "output_range_timeout_ms": 4200, "output_write_timeout_ms": 5000, "output_readback_timeout_ms": 6100
+                    })
+                    self.assertEqual(saved_timeouts.status_code, 200, saved_timeouts.text)
+                    self.assertEqual(saved_timeouts.json(), {"range_ms": 4200, "write_ms": 5000, "readback_ms": 6100})
+                    self.assertEqual(database.setting("output_readback_timeout_ms"), "6100")
+                    invalid_timeouts = client.put("/api/settings/output-timeouts", headers=headers, json={
+                        "output_range_timeout_ms": 100, "output_write_timeout_ms": 5000, "output_readback_timeout_ms": 5000
+                    })
+                    self.assertEqual(invalid_timeouts.status_code, 422)
                     gateway_id, node_id = str(uuid4()), str(uuid4())
                     created_gateway = client.post("/api/gateways", headers=headers, json={
                         "id": gateway_id, "name": "Bench gateway", "model": "USR-G781", "transport_mode": "MODBUS_TCP"

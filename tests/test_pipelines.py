@@ -4,12 +4,14 @@ import struct
 import unittest
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from unittest.mock import patch
 
 from backend.gateway import GatewaySession
 from backend.output import OutputDriver
 from backend.pipelines import PipelineError, PipelineService
 from backend.store import Store, utc_now
 from backend.modbus import with_crc
+from backend import app as service_app
 
 
 class SessionMap:
@@ -147,8 +149,103 @@ class PipelineExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.fc16),1)
         self.assertAlmostEqual(struct.unpack(">f",self.fc16[0][7:11])[0],4.0)
         row=self.service.get(pipeline_id)
-        self.assertEqual(row["status"],"SOURCE_STALE")
+        self.assertEqual(row["status"],"FAILSAFE_ACKNOWLEDGED")
         self.assertTrue(row["failsafe_attempted"])
+
+    async def test_source_disconnect_callback_attempts_safe_setpoint_once(self):
+        config={"transformation":"DIRECT","update_interval_ms":1000,"deadband_ma":0,"stale_timeout_ms":5000,
+                "timeout_ms":1000,"retries":0,"fail_safe_policy":"SAFE_SETPOINT","safe_setpoint_ma":4}
+        pipeline_id=await self._create_and_arm(self.definition(config=config))
+        callback_session=type("Session",(),{"gateway_id":"gw-input","session_id":"input-session",
+            "desynchronized":False,"transport_mode":"MODBUS_TCP"})()
+        registry=type("Registry",(),{"by_gateway":{"gw-input":"input-session"},"shutting_down":False,"sessions":{},"tasks":{}})()
+        with patch.object(service_app,"store",self.store), patch.object(service_app,"sessions",registry), \
+             patch.object(service_app,"pipelines",self.service):
+            await service_app.on_disconnect(callback_session, ConnectionError("LTE link dropped"))
+            await service_app.on_disconnect(callback_session, ConnectionError("duplicate close callback"))
+        commands=self.store.rows("SELECT * FROM output_commands WHERE pipeline_id=?",(pipeline_id,))
+        self.assertEqual(len(commands),1)
+        self.assertEqual(commands[0]["classification"],"FAILSAFE")
+        self.assertEqual(commands[0]["result"],"ACKNOWLEDGED")
+        self.assertEqual(self.service.get(pipeline_id)["status"],"FAILSAFE_ACKNOWLEDGED")
+        self.assertAlmostEqual(commands[0]["target_ma"],4.0)
+
+    async def test_source_disconnect_with_output_down_is_failsafe_unconfirmed(self):
+        config={"transformation":"DIRECT","update_interval_ms":1000,"deadband_ma":0,"stale_timeout_ms":5000,
+                "timeout_ms":1000,"retries":0,"fail_safe_policy":"SAFE_SETPOINT","safe_setpoint_ma":4}
+        pipeline_id=await self._create_and_arm(self.definition(config=config))
+        self.sessions.items.pop("gw-output")
+        callback_session=type("Session",(),{"gateway_id":"gw-input","session_id":"input-session",
+            "desynchronized":False,"transport_mode":"MODBUS_TCP"})()
+        registry=type("Registry",(),{"by_gateway":{"gw-input":"input-session"},"shutting_down":False,"sessions":{},"tasks":{}})()
+        with patch.object(service_app,"store",self.store), patch.object(service_app,"sessions",registry), \
+             patch.object(service_app,"pipelines",self.service):
+            await service_app.on_disconnect(callback_session, ConnectionError("LTE link dropped"))
+        self.assertEqual(self.fc16,[])
+        row=self.service.get(pipeline_id)
+        self.assertEqual(row["status"],"FAILSAFE_UNCONFIRMED")
+        self.assertEqual(row["failsafe_status"],"UNCONFIRMED")
+        self.assertFalse(row["armed"])
+
+    async def test_backend_shutdown_disconnect_does_not_issue_failsafe_write(self):
+        config={"transformation":"DIRECT","update_interval_ms":1000,"deadband_ma":0,"stale_timeout_ms":5000,
+                "timeout_ms":1000,"retries":0,"fail_safe_policy":"SAFE_SETPOINT","safe_setpoint_ma":4}
+        pipeline_id=await self._create_and_arm(self.definition(config=config))
+        callback_session=type("Session",(),{"gateway_id":"gw-input","session_id":"input-session",
+            "desynchronized":False,"transport_mode":"MODBUS_TCP"})()
+        registry=type("Registry",(),{"by_gateway":{"gw-input":"input-session"},"shutting_down":True,"sessions":{},"tasks":{}})()
+        with patch.object(service_app,"store",self.store), patch.object(service_app,"sessions",registry), \
+             patch.object(service_app,"pipelines",self.service):
+            await service_app.on_disconnect(callback_session, ConnectionError("server shutdown"))
+        self.assertEqual(self.fc16,[])
+        self.assertTrue(self.service.get(pipeline_id)["armed"])
+
+    async def test_consecutive_write_failures_enter_manual_fault_lockout(self):
+        pipeline_id=await self._create_and_arm(self.definition())
+        row=self.service.get(pipeline_id)
+        measurement=self.store.one("SELECT * FROM measurements WHERE node_id=?",(self.input_id,))
+        for attempt in range(3):
+            self.service._record_write_failure(row,12.5,"OUTPUT_WRITE_FAILED",f"simulated failure {attempt+1}",measurement,unknown=False)
+        state=self.service.get(pipeline_id)
+        self.assertEqual(state["status"],"OUTPUT_FAULT_LOCKOUT")
+        self.assertFalse(state["armed"])
+        self.assertEqual(state["consecutive_write_failures"],3)
+        self.assertIsNotNone(state["faulted_at"])
+
+    async def test_pipeline_loop_runs_independent_work_concurrently_with_bound(self):
+        first=await self._create_and_arm(self.definition(destination_channel=2))
+        other=self.definition(destination_channel=3,pipeline_id="parallel-pipeline")
+        other["name"]="AI1 to AO3"
+        second=await self._create_and_arm(other)
+        started=asyncio.Event()
+        release=asyncio.Event()
+        completed=[]
+        original=self.service.execute
+        async def controlled(pipeline_id):
+            if pipeline_id==first:
+                started.set()
+                await release.wait()
+            else:
+                completed.append(pipeline_id)
+        self.service.execute=controlled
+        self.service.MAX_CONCURRENT=2
+        self.service.running=True
+        loop=asyncio.create_task(self.service.loop())
+        try:
+            await asyncio.wait_for(started.wait(),1)
+            await asyncio.wait_for(asyncio.sleep(0.5),1)
+            self.assertIn(second,completed)
+            self.assertLessEqual(len(self.service._workers),2)
+            self.assertNotIn(first,completed)
+        finally:
+            release.set()
+            self.service.running=False
+            loop.cancel()
+            await asyncio.gather(loop,return_exceptions=True)
+            workers=list(self.service._workers.values())
+            if workers: await asyncio.gather(*workers,return_exceptions=True)
+            self.service.execute=original
+            self.service._workers.clear()
 
     async def test_stale_input_with_hold_last_sends_no_fc16(self):
         pipeline_id=await self._create_and_arm()
@@ -157,6 +254,17 @@ class PipelineExecutionTests(unittest.IsolatedAsyncioTestCase):
         await self.service.execute(pipeline_id)
         self.assertEqual(self.fc16,[])
         self.assertEqual(self.service.get(pipeline_id)["status"],"SOURCE_STALE")
+
+    async def test_missing_engineering_source_uses_central_fail_safe_transition(self):
+        config={"transformation":"TWO_POINT","input_min":0,"input_max":100,"output_min_ma":4,"output_max_ma":20,
+                "update_interval_ms":1000,"deadband_ma":0,"stale_timeout_ms":5000,"timeout_ms":1000,"retries":0,
+                "fail_safe_policy":"SAFE_SETPOINT","safe_setpoint_ma":4}
+        pipeline_id=await self._create_and_arm(self.definition(value_type="ENGINEERING",config=config))
+        self.store.run("UPDATE measurements SET engineering_value=NULL WHERE node_id=?",(self.input_id,))
+        await self.service.execute(pipeline_id)
+        self.assertEqual(len(self.fc16),1)
+        self.assertAlmostEqual(struct.unpack(">f",self.fc16[0][7:11])[0],4.0)
+        self.assertEqual(self.service.get(pipeline_id)["status"],"FAILSAFE_ACKNOWLEDGED")
 
     async def test_destination_owner_is_unique_and_restart_disarms(self):
         first=await self._create_and_arm()

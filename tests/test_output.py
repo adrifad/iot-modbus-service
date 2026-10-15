@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from backend.gateway import GatewaySession
 from backend.modbus import with_crc
-from backend.output import OutputDriver, OutputError
+from backend.output import OutputDriver, OutputError, OutputOutcomeUnknown
 from backend.store import Store, utc_now
 
 
@@ -23,6 +23,7 @@ class OutputDriverIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.setpoints = [0] * 6
         self.write_requests = []
         self.ignore_writes = False
+        self.drop_write_ack = False
 
         async def simulated_me31(reader, writer):
             try:
@@ -52,7 +53,8 @@ class OutputDriverIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         current = struct.unpack(">f", request[7:11])[0]
                         if not self.ignore_writes:
                             self.setpoints[channel] = round(current * 1000)
-                        writer.write(with_crc(prefix[:1] + bytes((16,)) + request[2:6]))
+                        if not self.drop_write_ack:
+                            writer.write(with_crc(prefix[:1] + bytes((16,)) + request[2:6]))
                     else:
                         raise AssertionError(f"unexpected function {function}")
                     await writer.drain()
@@ -130,8 +132,28 @@ class OutputDriverIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.driver.set_output(self.node_id, 1, 12.5, source="MANUAL:test")
         self.assertEqual(len(self.write_requests), 1)
         command=self.store.one("SELECT * FROM output_commands WHERE node_id=?",(self.node_id,))
-        self.assertEqual(command["result"],"FAILED")
+        self.assertEqual(command["result"],"READBACK_MISMATCH")
         self.assertEqual(command["readback_ma"],0.0)
+
+    async def test_fc16_timeout_is_unknown_and_never_blindly_retried(self):
+        await self._device()
+        self.store.set_setting("output_write_timeout_ms", "250")
+        self.drop_write_ack = True
+        with self.assertRaises(OutputOutcomeUnknown):
+            await self.driver.set_output(self.node_id, 1, 12.5, source="MANUAL:test")
+        self.assertEqual(len(self.write_requests),1)
+        command=self.store.one("SELECT * FROM output_commands WHERE node_id=?",(self.node_id,))
+        self.assertEqual(command["result"],"WRITE_OUTCOME_UNKNOWN")
+        self.assertIn("01 10 00 00",command["request_hex"])
+        self.assertTrue(self.session.desynchronized)
+
+    async def test_output_timeouts_read_persistent_configuration_and_validate_bounds(self):
+        await self._device()
+        self.store.set_setting("output_range_timeout_ms","4200")
+        self.assertEqual(self.driver.timeout_ms("output_range_timeout_ms"),4200)
+        self.assertEqual(self.driver.timeout_ms("output_range_timeout_ms",3000),3000)
+        with self.assertRaisesRegex(OutputError,"between 250 and 30000"):
+            self.driver.timeout_ms("output_range_timeout_ms",100)
 
     async def test_manual_write_blocked_while_pipeline_owns_channel(self):
         await self._device()

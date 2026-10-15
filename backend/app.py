@@ -37,12 +37,14 @@ class SessionRegistry:
         self.tasks: dict[str, asyncio.Task] = {}
         self.by_gateway: dict[str, str] = {}
         self.lock = asyncio.Lock()
+        self.shutting_down = False
 
     def for_gateway(self, gateway_id):
         session = self.sessions.get(self.by_gateway.get(gateway_id, ""))
         return session if session and session.commissioned else None
 
-    async def assign(self, session, gateway):
+    async def assign(self, session, gateway, *, identity_verified=False, commissioning_method="OPERATOR_ASSIGNMENT"):
+        replaced = False
         async with self.lock:
             previous = self.for_gateway(gateway["id"])
             if previous is session:
@@ -52,15 +54,18 @@ class SessionRegistry:
                 self.by_gateway.pop(gateway["id"], None)
                 await previous.retire()
                 self.store.event("SESSION_REPLACED", "Gateway session explicitly replaced during commissioning", gateway_id=gateway["id"],protocol=previous.transport_mode)
-                _disarm_pipelines_for_gateway(gateway["id"], "Gateway session replaced; operator re-arm is required", self.store)
-            await session.commission(gateway["id"], gateway["transport_mode"])
+                replaced = True
+            await session.commission(gateway["id"], gateway["transport_mode"], identity_verified=identity_verified, commissioning_method=commissioning_method)
             self.by_gateway[gateway["id"]] = session.session_id
             old_connected = gateway.get("last_connected_at") is not None
             now = utc_now()
             self.store.run("UPDATE gateways SET last_connected_at=?,last_activity_at=?,reconnection_count=reconnection_count+?,updated_at=? WHERE id=?", (now,now,int(old_connected),now,gateway["id"]))
             self.store.event("RECONNECTED" if old_connected else "CONNECTED", f"Gateway session commissioned from {session.peer}", gateway_id=gateway["id"],protocol=session.transport_mode)
+        if replaced and self.store is store:
+            await pipelines.gateway_disconnected(gateway["id"], "previous session replaced", operator_initiated=False)
 
     async def shutdown(self):
+        self.shutting_down = True
         sessions = list(self.sessions.values())
         for session in sessions:
             await session.retire()
@@ -84,26 +89,19 @@ pipelines = PipelineService(store, sessions, output_driver)
 tcp_server = None
 
 
-def _disarm_pipelines_for_gateway(gateway_id, reason, target_store=None):
-    target_store = target_store or store
-    affected = target_store.rows("""SELECT p.id,p.name,s.gateway_id AS source_gateway,d.gateway_id AS destination_gateway
-        FROM mappings p JOIN nodes s ON s.id=p.source_node_id JOIN nodes d ON d.id=p.destination_node_id
-        WHERE p.enabled=1 AND p.armed=1 AND (s.gateway_id=? OR d.gateway_id=?)""", (gateway_id,gateway_id))
-    for pipeline in affected:
-        status = "OUTPUT_DISCONNECTED" if pipeline["destination_gateway"] == gateway_id else "SOURCE_DISCONNECTED"
-        detail = f"{reason}; pipeline remains configured but disarmed"
-        target_store.run("UPDATE mappings SET armed=0,status=?,last_error=?,updated_at=? WHERE id=?", (status,detail,utc_now(),pipeline["id"]))
-        target_store.audit("AUTO_DISARM", "pipeline", pipeline["id"], {"gateway_id":gateway_id,"status":status,"reason":reason})
-        pipelines._next_due.pop(pipeline["id"], None)
-
-
 async def on_disconnect(session, error=None):
     if session.gateway_id:
         if sessions.by_gateway.get(session.gateway_id) == session.session_id:
             sessions.by_gateway.pop(session.gateway_id, None)
-            store.run("UPDATE gateways SET last_disconnected_at=?,connection_errors=connection_errors+? WHERE id=?", (utc_now(),int(error is not None),session.gateway_id))
-            store.event("SESSION_DESYNCHRONIZED" if session.desynchronized else "DISCONNECTED", error or "Gateway TCP session closed", gateway_id=session.gateway_id, protocol=session.transport_mode)
-            _disarm_pipelines_for_gateway(session.gateway_id, error or "Gateway TCP session closed")
+            reason = str(error or "Gateway TCP session closed")
+            store.run("UPDATE gateways SET last_disconnected_at=?,last_disconnect_reason=?,connection_errors=connection_errors+? WHERE id=?", (utc_now(),reason,int(error is not None),session.gateway_id))
+            store.event("SESSION_DESYNCHRONIZED" if session.desynchronized else "DISCONNECTED", reason, gateway_id=session.gateway_id, protocol=session.transport_mode)
+            # Free the closed socket slot before any bounded fail-safe network
+            # operation; this callback runs without the registry lock.
+            sessions.sessions.pop(session.session_id, None)
+            sessions.tasks.pop(session.session_id, None)
+            if not sessions.shutting_down:
+                await pipelines.gateway_disconnected(session.gateway_id, reason, operator_initiated=False)
     elif session.state != "RETIRED":
         store.event("PENDING_DISCONNECTED", "Uncommissioned TCP session closed", protocol="TCP")
 
@@ -140,7 +138,7 @@ async def authenticate_gateway_identity(session, identity):
                 or not _peer_allowed_for_identity(session)
                 or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), gateway["registration_token_hash"])):
             raise ValueError
-        await sessions.assign(session, gateway)
+        await sessions.assign(session, gateway, identity_verified=True, commissioning_method="G781_LINK_REGISTRATION")
         store.audit("IDENTITY_COMMISSION","gateway",gateway_id,{"method":"G781_LINK_REGISTRATION","tls":session.is_tls},"gateway")
         return True
     except (UnicodeDecodeError, ValueError):
@@ -285,6 +283,7 @@ async def on_tcp_client(reader, writer):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tcp_server
+    sessions.shutting_down = False
     host = os.getenv("TCP_LISTEN_HOST", "0.0.0.0")
     port = int(os.getenv("TCP_LISTEN_PORT", "5001"))
     cert_file, key_file = os.getenv("TCP_TLS_CERT_FILE"), os.getenv("TCP_TLS_KEY_FILE")
@@ -299,6 +298,9 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     pipelines.start()
     yield
+    # Mark intentional shutdown before cancelling RTU transactions. Their
+    # retired sessions must not trigger physical fail-safe writes.
+    sessions.shutting_down = True
     await pipelines.stop()
     await scheduler.stop()
     tcp_server.close()
@@ -405,6 +407,11 @@ class OutputSetpointInput(BaseModel):
             raise ValueError("target current must be finite")
         return value
 
+
+class OutputTimeoutSettings(BaseModel):
+    output_range_timeout_ms: int = Field(ge=250, le=30000)
+    output_write_timeout_ms: int = Field(ge=250, le=30000)
+    output_readback_timeout_ms: int = Field(ge=250, le=30000)
 
 class PollItemCreate(BaseModel):
     id: str | None = Field(default=None, max_length=100)
@@ -558,6 +565,14 @@ async def list_gateways(_: str = Depends(authorize)):
         public=_gateway_public(row)
         diagnostic=store.one("SELECT at,result,detail FROM events WHERE gateway_id=? ORDER BY id DESC LIMIT 1",(row["id"],))
         public["last_diagnostic"]=diagnostic
+        session=sessions.for_gateway(row["id"])
+        public["connection_state"]="CONNECTED" if session else "DISCONNECTED"
+        public["commissioning_state"]="COMMISSIONED" if session else "PENDING_OR_DISCONNECTED"
+        public["identity_state"]="VERIFIED" if session and session.identity_verified else "OPERATOR_ASSOCIATED" if session else "NOT_VERIFIED"
+        public["commissioning_method"]=session.commissioning_method if session else None
+        public["automatic_commissioning_available"]=bool(row.get("model","").upper().find("G781")>=0 and row.get("identity_method")=="G781_LINK_REGISTRATION" and row.get("transport_mode")=="TRANSPARENT_SERIAL")
+        public["manual_intervention_required"]=session is None
+        public["last_modbus_transaction"]=store.one("SELECT at,result,function_code,address,quantity,latency_ms,detail FROM events WHERE gateway_id=? AND function_code IS NOT NULL ORDER BY id DESC LIMIT 1",(row["id"],))
         result.append(public)
     return result
 
@@ -627,8 +642,8 @@ async def disconnect_gateway(gateway_id: str, actor=Depends(authorize)):
         if sessions.by_gateway.get(gateway_id) == session.session_id:
             sessions.by_gateway.pop(gateway_id, None)
         await session.retire()
-        store.run("UPDATE gateways SET last_disconnected_at=?,updated_at=? WHERE id=?", (utc_now(),utc_now(),gateway_id))
-        _disarm_pipelines_for_gateway(gateway_id, "Gateway intentionally disconnected by an administrator")
+        store.run("UPDATE gateways SET last_disconnected_at=?,last_disconnect_reason=?,updated_at=? WHERE id=?", (utc_now(),"Operator initiated disconnect",utc_now(),gateway_id))
+    await pipelines.gateway_disconnected(gateway_id, "Operator initiated disconnect", operator_initiated=True)
     store.event("OPERATOR_DISCONNECT", "Gateway session intentionally disconnected by an administrator", gateway_id=gateway_id, protocol=session.transport_mode)
     store.audit("DISCONNECT_SESSION", "gateway", gateway_id, {"session_id": session.session_id}, actor)
     return {"gateway_id": gateway_id, "session_id": session.session_id, "state": "DISCONNECTED"}
@@ -663,7 +678,7 @@ async def delete_gateway(gateway_id: str, actor=Depends(authorize)):
 
 @app.get("/api/gateways/sessions")
 async def gateway_sessions(_: str = Depends(authorize)):
-    return [{"session_id":s.session_id,"peer":s.peer,"gateway_id":s.gateway_id,"transport_mode":s.transport_mode,"connected":s.connected,"commissioned":s.commissioned,"state":s.state,"last_activity":s.last_activity,"request_count":s.request_count} for s in sessions.sessions.values() if not s.closed]
+    return [{"session_id":s.session_id,"peer":s.peer,"gateway_id":s.gateway_id,"transport_mode":s.transport_mode,"connected":s.connected,"commissioned":s.commissioned,"identity_verified":s.identity_verified,"commissioning_method":s.commissioning_method,"state":s.state,"last_activity":s.last_activity,"request_count":s.request_count} for s in sessions.sessions.values() if not s.closed]
 
 
 @app.post("/api/gateways/sessions/{session_id}/assign/{gateway_id}")
@@ -1227,7 +1242,17 @@ async def mappings(_: str = Depends(authorize)):
 
 @app.get("/api/settings")
 async def settings(_: str = Depends(authorize)):
-    return {"tcp_listener":{"host":os.getenv("TCP_LISTEN_HOST","0.0.0.0"),"port":int(os.getenv("TCP_LISTEN_PORT","5001"))},"polling":{"minimum_interval_ms":250,"gateway_minimum_request_interval_ms":int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS","50")),"default_timeout_ms":1500,"max_retries":5},"freshness_seconds":int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),"event_retention_days":int(os.getenv("EVENT_RETENTION_DAYS","90")),"measurement_retention_days":int(os.getenv("MEASUREMENT_RETENTION_DAYS","365")),"hardware_writes":"ME31_AO_ONLY_AUTHORIZED_MANUAL_OR_ARMED_PIPELINE"}
+    return {"tcp_listener":{"host":os.getenv("TCP_LISTEN_HOST","0.0.0.0"),"port":int(os.getenv("TCP_LISTEN_PORT","5001"))},"polling":{"minimum_interval_ms":250,"gateway_minimum_request_interval_ms":int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS","50")),"default_timeout_ms":1500,"max_retries":5},"freshness_seconds":int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),"event_retention_days":int(os.getenv("EVENT_RETENTION_DAYS","90")),"measurement_retention_days":int(os.getenv("MEASUREMENT_RETENTION_DAYS","365")),"output_timeouts":{"range_ms":int(store.setting("output_range_timeout_ms","5000")),"write_ms":int(store.setting("output_write_timeout_ms","5000")),"readback_ms":int(store.setting("output_readback_timeout_ms","5000"))},"hardware_writes":"ME31_AO_ONLY_AUTHORIZED_MANUAL_OR_ARMED_PIPELINE"}
+
+
+@app.put("/api/settings/output-timeouts")
+async def update_output_timeouts(data: OutputTimeoutSettings, actor=Depends(authorize)):
+    values = data.model_dump()
+    with store.transaction() as db:
+        for key, value in values.items():
+            db.execute("INSERT INTO system_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key,str(value),utc_now()))
+    store.audit("UPDATE", "system_settings", "output_timeouts", values, actor)
+    return {"range_ms":values["output_range_timeout_ms"],"write_ms":values["output_write_timeout_ms"],"readback_ms":values["output_readback_timeout_ms"]}
 
 
 @app.websocket("/ws/telemetry")

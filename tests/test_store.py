@@ -22,7 +22,7 @@ class StoreTests(unittest.TestCase):
             second = Store(str(path))
             try:
                 self.assertEqual(second.one("SELECT name FROM gateways WHERE id=?", (gateway_id,))["name"], "Persistent gateway")
-                self.assertEqual(second.one("SELECT MAX(version) version FROM schema_migrations")["version"], 7)
+                self.assertEqual(second.one("SELECT MAX(version) version FROM schema_migrations")["version"], 8)
                 self.assertTrue(path.exists())
             finally:
                 second.close()
@@ -57,7 +57,7 @@ class StoreTests(unittest.TestCase):
                 migrated.close()
             reopened=Store(str(path))
             try:
-                self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],7)
+                self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],8)
                 self.assertEqual(reopened.one("SELECT COUNT(*) count FROM channels WHERE node_id='legacy-ao'")["count"],6)
             finally:
                 reopened.close()
@@ -76,7 +76,7 @@ class StoreTests(unittest.TestCase):
                 source_value_type,config_json,enabled,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",values[1])
             store.run("DROP INDEX mappings_active_destination")
             store.run("CREATE UNIQUE INDEX mappings_active_destination ON mappings(destination_node_id,destination_channel) WHERE enabled=1")
-            store.run("DELETE FROM schema_migrations WHERE version=7")
+            store.run("DELETE FROM schema_migrations WHERE version>=7")
             store.close()
             migrated=Store(str(path))
             try:

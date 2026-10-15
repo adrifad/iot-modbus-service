@@ -18,6 +18,16 @@ type Pipeline = {
   last_requested_value: number | null
   last_acknowledged_value: number | null
   last_success_at: string | null
+  last_communication_at: string | null
+  last_attempt_at: string | null
+  last_raw_ma: number | null
+  last_calibrated_ma: number | null
+  last_engineering_value: number | null
+  source_quality: string | null
+  consecutive_write_failures: number
+  last_failed_target: number | null
+  faulted_at: string | null
+  failsafe_status: string
   last_error: string | null
 }
 
@@ -35,7 +45,7 @@ const initial: Definition = {
   name: '', source_node_id: '', source_channel: 1, destination_node_id: '', destination_channel: 1,
   source_value_type: 'CALIBRATED_MA',
   config: { transformation: 'DIRECT', update_interval_ms: 1000, deadband_ma: 0.05, stale_timeout_ms: 10000,
-    timeout_ms: 2000, retries: 1, fail_safe_policy: 'HOLD_LAST' },
+    timeout_ms: 5000, retries: 1, max_consecutive_write_failures: 3, write_retry_backoff_ms: 300, fail_safe_policy: 'HOLD_LAST' },
 }
 
 const date = (value: string | null) => value ? new Date(value).toLocaleString() : 'No confirmed write'
@@ -43,7 +53,7 @@ const fixed = (value: number | null) => value == null ? '—' : `${value.toFixed
 
 function statusTone(status: string) {
   if (status === 'RUNNING') return 'good'
-  if (['DISABLED', 'DISARMED', 'WAITING_FOR_SOURCE'].includes(status)) return ''
+  if (['DISABLED', 'DISARMED', 'WAITING_FOR_SOURCE', 'FAILSAFE_ACKNOWLEDGED'].includes(status)) return ''
   return 'warning'
 }
 
@@ -87,7 +97,7 @@ export default function PipelinePage() {
   const destinationDetail = detailRow ? destinationNodes.find(node => node.id === detailRow.destination_node_id) : undefined
   const sourceMeasurements = useQuery({
     queryKey: ['pipeline-source', detailRow?.source_node_id],
-    queryFn: () => api<{ channel: number; quality: string; measured_at: string; raw_ma: number; calibrated_ma: number; engineering_value: number | null }[]>(`/api/nodes/${detailRow!.source_node_id}/measurements/latest`),
+    queryFn: () => api<{ channel: number; quality: string; measured_at: string; raw_ma: number; calibrated_ma: number; engineering_value: number | null; engineering_unit: string | null }[]>(`/api/nodes/${detailRow!.source_node_id}/measurements/latest`),
     enabled: !!detailRow,
     refetchInterval: detailRow ? 2000 : false,
   })
@@ -138,8 +148,10 @@ export default function PipelinePage() {
           <div className="field"><label htmlFor="interval">Update interval (ms)</label><input id="interval" className="input" type="number" min={250} max={60000} value={Number(form.config.update_interval_ms || 1000)} onChange={e => setConfig('update_interval_ms', Number(e.target.value))} /></div>
           <div className="field"><label htmlFor="deadband">Deadband (mA)</label><input id="deadband" className="input" type="number" min={0} max={25} step={0.01} value={Number(form.config.deadband_ma || 0)} onChange={e => setConfig('deadband_ma', Number(e.target.value))} /></div>
           <div className="field"><label htmlFor="stale">Maximum source age (ms)</label><input id="stale" className="input" type="number" min={500} max={3600000} value={Number(form.config.stale_timeout_ms || 10000)} onChange={e => setConfig('stale_timeout_ms', Number(e.target.value))} /></div>
-          <div className="field"><label htmlFor="timeout">Write timeout (ms)</label><input id="timeout" className="input" type="number" min={100} max={10000} value={Number(form.config.timeout_ms || 2000)} onChange={e => setConfig('timeout_ms', Number(e.target.value))} /></div>
+          <div className="field"><label htmlFor="timeout">Write timeout (ms)</label><input id="timeout" className="input" type="number" min={250} max={30000} value={Number(form.config.timeout_ms || 5000)} onChange={e => setConfig('timeout_ms', Number(e.target.value))} /></div>
           <div className="field"><label htmlFor="retries">Retries</label><input id="retries" className="input" type="number" min={0} max={3} value={Number(form.config.retries ?? 1)} onChange={e => setConfig('retries', Number(e.target.value))} /></div>
+          <div className="field"><label htmlFor="write-failure-limit">Write fault limit</label><input id="write-failure-limit" className="input" type="number" min={1} max={10} value={Number(form.config.max_consecutive_write_failures ?? 3)} onChange={e => setConfig('max_consecutive_write_failures', Number(e.target.value))} /></div>
+          <div className="field"><label htmlFor="write-backoff">Retry backoff (ms)</label><input id="write-backoff" className="input" type="number" min={100} max={5000} value={Number(form.config.write_retry_backoff_ms ?? 300)} onChange={e => setConfig('write_retry_backoff_ms', Number(e.target.value))} /></div>
           {form.config.transformation === 'GAIN_OFFSET' && <><div className="field"><label htmlFor="gain">Gain</label><input id="gain" className="input" type="number" step="0.0001" value={Number(form.config.gain ?? 1)} onChange={e => setConfig('gain', Number(e.target.value))} /></div><div className="field"><label htmlFor="offset">Offset (mA)</label><input id="offset" className="input" type="number" step="0.001" value={Number(form.config.offset_ma ?? 0)} onChange={e => setConfig('offset_ma', Number(e.target.value))} /></div></>}
           {form.config.transformation === 'TWO_POINT' && <><div className="field"><label htmlFor="in-min">Input minimum</label><input id="in-min" className="input" type="number" step="0.001" value={Number(form.config.input_min ?? 4)} onChange={e => setConfig('input_min', Number(e.target.value))} /></div><div className="field"><label htmlFor="in-max">Input maximum</label><input id="in-max" className="input" type="number" step="0.001" value={Number(form.config.input_max ?? 20)} onChange={e => setConfig('input_max', Number(e.target.value))} /></div><div className="field"><label htmlFor="out-min">Output minimum (mA)</label><input id="out-min" className="input" type="number" step="0.001" value={Number(form.config.output_min_ma ?? 4)} onChange={e => setConfig('output_min_ma', Number(e.target.value))} /></div><div className="field"><label htmlFor="out-max">Output maximum (mA)</label><input id="out-max" className="input" type="number" step="0.001" value={Number(form.config.output_max_ma ?? 20)} onChange={e => setConfig('output_max_ma', Number(e.target.value))} /></div></>}
           <div className="field"><label htmlFor="failsafe">Invalid-source policy</label><select id="failsafe" className="select" value={String(form.config.fail_safe_policy || 'HOLD_LAST')} onChange={e => setConfig('fail_safe_policy', e.target.value)}><option value="HOLD_LAST">HOLD_LAST · retain last device setpoint</option><option value="SAFE_SETPOINT">SAFE_SETPOINT · attempt configured mA</option></select></div>
@@ -166,8 +178,8 @@ export default function PipelinePage() {
     </section>
 
     {detailRow && <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && setDetail(null)}><section className="modal" role="dialog" aria-modal="true" aria-label={`${detailRow.name} details`}><div className="modal-head"><strong>{detailRow.name}</strong><button className="icon-button" onClick={() => setDetail(null)} aria-label="Close details">×</button></div><div className="modal-body">
-      <div className="notice info">{channelNames.get(detailRow.source_node_id) || detailRow.source_node_id} AI{detailRow.source_channel} → Calibration → {String(detailRow.config.transformation || 'DIRECT')} → FC16 → {channelNames.get(detailRow.destination_node_id) || detailRow.destination_node_id} AO{detailRow.destination_channel}</div>
-      <div className="health-list"><div className="health-line"><span>Runtime state</span><strong>{detailRow.status}{detailRow.armed ? ' · ARMED' : ''}</strong></div><div className="health-line"><span>Source gateway</span><strong>{sourceDetail?.gateway_state || 'UNKNOWN'} · Modbus {sourceDetail?.modbus_health || 'UNKNOWN'}</strong></div><div className="health-line"><span>Source sample</span><strong>{sourceMeasurement ? `${sourceMeasurement.quality} · ${date(sourceMeasurement.measured_at)}` : 'No measurement available'}</strong></div><div className="health-line"><span>Raw / calibrated input</span><strong>{sourceMeasurement ? `${fixed(sourceMeasurement.raw_ma)} / ${fixed(sourceMeasurement.calibrated_ma)}` : fixed(detailRow.last_source_value)}</strong></div><div className="health-line"><span>Output gateway</span><strong>{destinationDetail?.gateway_state || 'UNKNOWN'} · Modbus {destinationDetail?.modbus_health || 'UNKNOWN'}</strong></div><div className="health-line"><span>Transformed target</span><strong>{fixed(detailRow.last_requested_value)}</strong></div><div className="health-line"><span>Last acknowledged setpoint readback</span><strong>{fixed(detailRow.last_acknowledged_value)}</strong></div><div className="health-line"><span>Last confirmed update</span><strong>{date(detailRow.last_success_at)}</strong></div></div>
+      <div className="notice info">{channelNames.get(detailRow.source_node_id) || detailRow.source_node_id} AI{detailRow.source_channel} → Calibration → {String(detailRow.config.transformation || 'DIRECT')} → FC16 → {channelNames.get(detailRow.destination_node_id) || detailRow.destination_node_id} AO{detailRow.destination_channel}</div><p className="panel-note">AO readback is the module-reported setpoint. It does not measure physical output current.</p>
+      <div className="health-list"><div className="health-line"><span>Runtime state</span><strong>{detailRow.status}{detailRow.armed ? ' · ARMED' : ''}</strong></div><div className="health-line"><span>Source gateway</span><strong>{sourceDetail?.gateway_state || 'UNKNOWN'} · Modbus {sourceDetail?.modbus_health || 'UNKNOWN'}</strong></div><div className="health-line"><span>Source sample</span><strong>{sourceMeasurement ? `${sourceMeasurement.quality} · ${date(sourceMeasurement.measured_at)}` : 'No measurement available'}</strong></div><div className="health-line"><span>Measurement quality</span><strong>{detailRow.source_quality || sourceMeasurement?.quality || "UNKNOWN"}</strong></div><div className="health-line"><span>Raw / calibrated input</span><strong>{fixed(detailRow.last_raw_ma ?? sourceMeasurement?.raw_ma ?? null)} / {fixed(detailRow.last_calibrated_ma ?? sourceMeasurement?.calibrated_ma ?? null)}</strong></div><div className="health-line"><span>Engineering value</span><strong>{detailRow.last_engineering_value == null ? '—' : `${detailRow.last_engineering_value.toFixed(3)} ${sourceMeasurement?.engineering_unit || ''}`}</strong></div><div className="health-line"><span>Output gateway</span><strong>{destinationDetail?.gateway_state || 'UNKNOWN'} · Modbus {destinationDetail?.modbus_health || 'UNKNOWN'}</strong></div><div className="health-line"><span>Transformed target / last requested</span><strong>{fixed(detailRow.last_requested_value)}</strong></div><div className="health-line"><span>Last acknowledged setpoint readback</span><strong>{fixed(detailRow.last_acknowledged_value)}</strong></div><div className="health-line"><span>Consecutive write failures</span><strong>{detailRow.consecutive_write_failures} / {Number(detailRow.config.max_consecutive_write_failures || 3)}</strong></div><div className="health-line"><span>Last failed target</span><strong>{fixed(detailRow.last_failed_target)}</strong></div><div className="health-line"><span>Fail-safe</span><strong>{String(detailRow.config.fail_safe_policy || "HOLD_LAST")} · {detailRow.failsafe_status}</strong></div><div className="health-line"><span>Last write attempt</span><strong>{date(detailRow.last_attempt_at)}</strong></div><div className="health-line"><span>Last successful communication</span><strong>{date(detailRow.last_communication_at || detailRow.last_success_at)}</strong></div><div className="health-line"><span>Fault entered</span><strong>{date(detailRow.faulted_at)}</strong></div></div>
       {detailRow.last_error && <p className="error" role="alert">{detailRow.last_error}</p>}
       <h3>Recent output commands</h3>{history.isLoading ? <p className="panel-note">Loading command history…</p> : history.data?.length ? <div className="table-wrap"><table><thead><tr><th>Time</th><th>Source</th><th>Target</th><th>Readback</th><th>Result</th><th>Detail</th></tr></thead><tbody>{history.data.map((item, index) => <tr key={String(item.id || index)}><td>{date(String(item.at || ''))}</td><td>{String(item.source || '')}</td><td>{fixed(item.target_ma == null ? null : Number(item.target_ma))}</td><td>{fixed(item.readback_ma == null ? null : Number(item.readback_ma))}</td><td>{String(item.result || '')}</td><td>{String(item.detail || '')}</td></tr>)}</tbody></table></div> : <p className="panel-note">No pipeline output commands have been issued.</p>}
     </div></section></div>}

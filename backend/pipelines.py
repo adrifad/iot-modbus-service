@@ -3,11 +3,11 @@
 import asyncio
 import json
 import math
+import os
 import time
 from datetime import datetime, timezone
 
-from .gateway import OutputReadbackError
-from .output import OutputError
+from .output import OutputOutcomeUnknown
 from .store import utc_now
 
 
@@ -15,8 +15,17 @@ class PipelineError(ValueError):
     pass
 
 
+def _bounded_environment_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 class PipelineService:
     TICK_SECONDS = 0.2
+    MAX_CONCURRENT = _bounded_environment_int("PIPELINE_MAX_CONCURRENCY", 8, 1, 64)
 
     def __init__(self, store, sessions, output_driver):
         self.store = store
@@ -25,14 +34,18 @@ class PipelineService:
         self.running = False
         self.task: asyncio.Task | None = None
         self._next_due: dict[str, float] = {}
-        self._processing: set[str] = set()
+        self._workers: dict[str, asyncio.Task] = {}
+        self._pipeline_locks: dict[str, asyncio.Lock] = {}
+
+    def _pipeline_lock(self, pipeline_id: str) -> asyncio.Lock:
+        return self._pipeline_locks.setdefault(pipeline_id, asyncio.Lock())
 
     def start(self):
         if self.running:
             return
         # Process restart requires an operator to arm again. The configured
         # enabled state remains persistent, while no stale command is replayed.
-        self.store.run("UPDATE mappings SET armed=0,status=CASE WHEN enabled=1 THEN 'DISARMED' ELSE 'DISABLED' END")
+        self.store.run("UPDATE mappings SET armed=0,status=CASE WHEN status='OUTPUT_FAULT_LOCKOUT' THEN status WHEN enabled=1 THEN 'DISARMED' ELSE 'DISABLED' END,last_error=CASE WHEN status='OUTPUT_FAULT_LOCKOUT' THEN last_error ELSE 'Backend restart disarmed output control; operator re-arm required' END")
         self.running = True
         self.task = asyncio.create_task(self.loop(), name="pipeline-executor")
 
@@ -42,8 +55,16 @@ class PipelineService:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
             self.task = None
-        self._processing.clear()
-        self.store.run("UPDATE mappings SET armed=0,status=CASE WHEN enabled=1 THEN 'DISARMED' ELSE 'DISABLED' END,updated_at=? WHERE armed=1", (utc_now(),))
+        workers = list(self._workers.values())
+        if workers:
+            grace = _bounded_environment_int("PIPELINE_SHUTDOWN_GRACE_MS", 10000, 500, 30000) / 1000
+            done, pending = await asyncio.wait(workers, timeout=grace)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._workers.clear()
+        self.store.run("UPDATE mappings SET armed=0,status=CASE WHEN status='OUTPUT_FAULT_LOCKOUT' THEN status WHEN enabled=1 THEN 'DISARMED' ELSE 'DISABLED' END,last_error=CASE WHEN status='OUTPUT_FAULT_LOCKOUT' THEN last_error ELSE 'Backend shutdown disarmed output control; no safe setpoint was issued' END,updated_at=? WHERE armed=1", (utc_now(),))
 
     async def loop(self):
         while self.running:
@@ -51,25 +72,33 @@ class PipelineService:
             rows = self.store.rows("SELECT * FROM mappings WHERE enabled=1 AND armed=1 ORDER BY created_at,id")
             active_ids = {row["id"] for row in rows}
             self._next_due = {key: value for key, value in self._next_due.items() if key in active_ids}
+            self._workers = {key: task for key,task in self._workers.items() if not task.done()}
             for row in rows:
-                if row["id"] in self._processing or now < self._next_due.get(row["id"], 0):
+                if row["id"] in self._workers or now < self._next_due.get(row["id"], 0):
                     continue
+                if len(self._workers) >= self.MAX_CONCURRENT:
+                    break
                 try:
                     config = json.loads(row["config_json"])
                     interval = max(1, int(config.get("update_interval_ms", 1000))) / 1000
                 except (ValueError, TypeError, json.JSONDecodeError):
                     interval = 1
                 self._next_due[row["id"]] = now + max(0.25, interval)
-                self._processing.add(row["id"])
-                try:
-                    await self.execute(row["id"])
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._set_runtime(row["id"], "OUTPUT_WRITE_FAILED", last_error=str(exc))
-                finally:
-                    self._processing.discard(row["id"])
+                task = asyncio.create_task(self._worker(row["id"]), name=f"pipeline:{row['id']}")
+                self._workers[row["id"]] = task
             await asyncio.sleep(self.TICK_SECONDS)
+
+    async def _worker(self, pipeline_id: str):
+        current = asyncio.current_task()
+        try:
+            await self.execute(pipeline_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._set_runtime(pipeline_id, "OUTPUT_WRITE_FAILED", last_error=str(exc), last_attempt_at=utc_now())
+        finally:
+            if self._workers.get(pipeline_id) is current:
+                self._workers.pop(pipeline_id, None)
 
     def list(self):
         result = []
@@ -126,7 +155,8 @@ class PipelineService:
             raise PipelineError("Unsupported source value type")
         config = dict(data["config"])
         allowed_config={"transformation","gain","offset_ma","input_min","input_max","output_min_ma","output_max_ma",
-                        "update_interval_ms","deadband_ma","stale_timeout_ms","timeout_ms","retries","fail_safe_policy","safe_setpoint_ma"}
+                        "update_interval_ms","deadband_ma","stale_timeout_ms","timeout_ms","retries","fail_safe_policy","safe_setpoint_ma",
+                        "max_consecutive_write_failures","write_retry_backoff_ms"}
         if set(config)-allowed_config:
             raise PipelineError("Pipeline config contains unsupported parameters")
         mode = config.get("transformation", "DIRECT")
@@ -161,16 +191,22 @@ class PipelineService:
             raise PipelineError("Safe setpoint must be within 0–25 mA")
         interval = int(config.get("update_interval_ms", 1000))
         stale = int(config.get("stale_timeout_ms", 10000))
-        timeout = int(config.get("timeout_ms", 2000))
+        timeout = int(config.get("timeout_ms", 5000))
         retries = int(config.get("retries", 1))
+        max_failures = int(config.get("max_consecutive_write_failures", 3))
+        retry_backoff = int(config.get("write_retry_backoff_ms", 300))
         if interval not in range(250, 60001):
             raise PipelineError("Update interval must be 250–60000 ms")
         if stale not in range(500, 3600001):
             raise PipelineError("Stale timeout must be 500 ms–1 hour")
-        if timeout not in range(100, 10001):
-            raise PipelineError("Communication timeout must be 100–10000 ms")
+        if timeout not in range(250, 30001):
+            raise PipelineError("Output write timeout must be 250–30000 ms")
         if retries not in range(0, 4):
             raise PipelineError("Retry count must be 0–3")
+        if max_failures not in range(1, 11):
+            raise PipelineError("Maximum consecutive write failures must be 1–10")
+        if retry_backoff not in range(100, 5001):
+            raise PipelineError("Write retry backoff must be 100–5000 ms")
         fail_safe = config.get("fail_safe_policy", "HOLD_LAST")
         if fail_safe not in {"HOLD_LAST", "SAFE_SETPOINT"}:
             raise PipelineError("Fail-safe policy must be HOLD_LAST or SAFE_SETPOINT")
@@ -178,7 +214,8 @@ class PipelineService:
             raise PipelineError("SAFE_SETPOINT requires a configured safe_setpoint_ma")
         return {**data, "name": name, "config": {**config, "transformation": mode,
                 "update_interval_ms": interval, "stale_timeout_ms": stale, "timeout_ms": timeout,
-                "retries": retries, "deadband_ma": float(config.get("deadband_ma", 0)),
+                "retries": retries, "max_consecutive_write_failures": max_failures,
+                "write_retry_backoff_ms": retry_backoff, "deadband_ma": float(config.get("deadband_ma", 0)),
                 "fail_safe_policy": fail_safe}}
 
     def _channel_enabled(self, node_id, channel, kind):
@@ -272,7 +309,7 @@ class PipelineService:
                 owner = db.execute("SELECT id FROM mappings WHERE enabled=1 AND armed=1 AND destination_node_id=? AND destination_channel=? AND id<>?", (row["destination_node_id"], row["destination_channel"], pipeline_id)).fetchone()
                 if owner:
                     raise PipelineError("Another enabled pipeline owns this AO channel")
-                db.execute("UPDATE mappings SET armed=1,status='WAITING_FOR_SOURCE',last_error=NULL,failsafe_attempted=0,updated_at=? WHERE id=? AND enabled=1", (utc_now(), pipeline_id))
+                db.execute("UPDATE mappings SET armed=1,status='WAITING_FOR_SOURCE',last_error=NULL,failsafe_attempted=0,failsafe_status='NOT_APPLIED',consecutive_write_failures=0,faulted_at=NULL,updated_at=? WHERE id=? AND enabled=1", (utc_now(), pipeline_id))
         self._next_due[pipeline_id] = 0
         self.store.audit("ARM", "pipeline", pipeline_id, {"destination_range": [channel["output_min_ma"], channel["output_max_ma"]]})
         return self.get(pipeline_id)
@@ -282,8 +319,9 @@ class PipelineService:
         if not row:
             raise KeyError("Pipeline not found")
         detail = self.store.one("SELECT destination_node_id,destination_channel FROM mappings WHERE id=?", (pipeline_id,))
-        async with self.output.lock_for(detail["destination_node_id"], detail["destination_channel"]):
-            return self._finish_disarm(pipeline_id, row, disable)
+        async with self._pipeline_lock(pipeline_id):
+            async with self.output.lock_for(detail["destination_node_id"], detail["destination_channel"]):
+                return self._finish_disarm(pipeline_id, row, disable)
 
     def _finish_disarm(self, pipeline_id, row, disable):
         status = "DISABLED" if disable else "DISARMED"
@@ -297,80 +335,228 @@ class PipelineService:
         row = self.store.one("SELECT * FROM mappings WHERE id=?", (pipeline_id,))
         if not row:
             raise KeyError("Pipeline not found")
-        if row["armed"]:
-            raise PipelineError("Disarm the pipeline before deleting it")
-        async with self.output.lock_for(row["destination_node_id"], row["destination_channel"]):
+        async with self._pipeline_lock(pipeline_id):
             latest=self.store.one("SELECT armed FROM mappings WHERE id=?",(pipeline_id,))
             if latest and latest["armed"]:
                 raise PipelineError("Disarm the pipeline before deleting it")
-            self._next_due.pop(pipeline_id, None)
-            self.store.run("DELETE FROM mappings WHERE id=?", (pipeline_id,))
-            self.store.audit("DELETE", "pipeline", pipeline_id, {"name": row["name"]})
+            async with self.output.lock_for(row["destination_node_id"], row["destination_channel"]):
+                self._next_due.pop(pipeline_id, None)
+                self.store.run("DELETE FROM mappings WHERE id=?", (pipeline_id,))
+                self.store.audit("DELETE", "pipeline", pipeline_id, {"name": row["name"]})
 
     async def execute(self, pipeline_id):
-        row = self.store.one("SELECT * FROM mappings WHERE id=? AND enabled=1 AND armed=1", (pipeline_id,))
-        if not row:
-            return
+        async with self._pipeline_lock(pipeline_id):
+            row = self.store.one("SELECT * FROM mappings WHERE id=? AND enabled=1 AND armed=1", (pipeline_id,))
+            if not row:
+                return
+            await self._execute_locked(row)
+
+    async def _execute_locked(self, row):
+        pipeline_id = row["id"]
         config = json.loads(row["config_json"] or "{}")
         source = self.store.one("SELECT * FROM nodes WHERE id=?", (row["source_node_id"],))
         if not source or not source["polling_enabled"]:
-            await self._source_invalid(row, config, "SOURCE_INVALID", "Source node is missing or polling is disabled")
+            await self._transition_failure_locked(row, "SOURCE_INVALID", "Source node is missing or polling is disabled", source_failure=True)
             return
-        gateway = self.store.one("SELECT transport_mode FROM gateways WHERE id=?", (source["gateway_id"],)) if source["gateway_id"] else None
-        if not gateway or not self.sessions.for_gateway(source["gateway_id"]):
-            self._disarm_unhealthy(row, "SOURCE_DISCONNECTED", "Source gateway disconnected; re-arm after reconnection")
+        if not source["gateway_id"] or not self.sessions.for_gateway(source["gateway_id"]):
+            await self._transition_failure_locked(row, "SOURCE_DISCONNECTED", "Source gateway is disconnected or uncommissioned", source_failure=True)
             return
         measurement = self._latest_source(row, config)
         if not measurement:
-            await self._source_invalid(row, config, "WAITING_FOR_SOURCE", "No source measurement is available")
+            await self._transition_failure_locked(row, "WAITING_FOR_SOURCE", "No source measurement or polling channel mapping is available", source_failure=True)
             return
         age = self._age_seconds(measurement["measured_at"])
         if age is None or age * 1000 > int(config.get("stale_timeout_ms", 10000)):
-            await self._source_invalid(row, config, "SOURCE_STALE", "Source measurement exceeded the configured maximum age")
+            await self._transition_failure_locked(row, "SOURCE_STALE", "Source measurement exceeded the configured maximum age", source_failure=True, measurement=measurement)
             return
         if measurement["quality"] != "GOOD":
-            await self._source_invalid(row, config, "SOURCE_INVALID", f"Source measurement quality is {measurement['quality']}")
+            await self._transition_failure_locked(row, "SOURCE_INVALID", f"Source measurement quality is {measurement['quality']}", source_failure=True, measurement=measurement)
             return
-        value = self._source_value(measurement, row["source_value_type"])
+        try:
+            value = self._source_value(measurement, row["source_value_type"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            await self._transition_failure_locked(row, "SOURCE_INVALID", f"Selected source value is unavailable: {exc}", source_failure=True, measurement=measurement)
+            return
         if value is None or not math.isfinite(value):
-            await self._source_invalid(row, config, "SOURCE_INVALID", "Selected source value is unavailable or non-finite")
+            await self._transition_failure_locked(row, "SOURCE_INVALID", "Selected source value is unavailable or non-finite", source_failure=True, measurement=measurement)
             return
-        target = self._transform(value, config)
+        try:
+            target = self._transform(value, config)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            await self._transition_failure_locked(row, "SOURCE_INVALID", f"Source transformation failed: {exc}", source_failure=True, measurement=measurement)
+            return
         if not math.isfinite(target):
-            await self._source_invalid(row, config, "SOURCE_INVALID", "Transformed output target is not finite")
+            await self._transition_failure_locked(row, "SOURCE_INVALID", "Transformed output target is not finite", source_failure=True, measurement=measurement)
             return
         previous = row["last_acknowledged_value"]
-        self._set_runtime(pipeline_id, "RUNNING", last_source_value=value, last_requested_value=target,
-                          last_error=None, failsafe_attempted=0)
+        self._set_runtime(pipeline_id, "RUNNING", last_source_value=value, last_raw_ma=measurement.get("raw_ma"),
+                          last_calibrated_ma=measurement.get("calibrated_ma"), last_engineering_value=measurement.get("engineering_value"),
+                          source_quality=measurement.get("quality"), last_requested_value=target, last_error=None,
+                          failsafe_attempted=0, failsafe_status="NOT_APPLIED")
         if previous is not None and abs(target - previous) <= float(config.get("deadband_ma", 0)):
             return
         destination = self.store.one("SELECT * FROM nodes WHERE id=?", (row["destination_node_id"],))
         if not destination or destination["node_type"] != "ANALOG_OUTPUT" or not destination["polling_enabled"]:
-            self._set_runtime(pipeline_id, "CONFIGURATION_ERROR", last_error="Destination output node is missing or disabled")
+            await self._transition_failure_locked(row, "CONFIGURATION_ERROR", "Destination output node is missing or disabled", source_failure=False, destination_failure=True, measurement=measurement)
             return
-        if not self.sessions.for_gateway(destination["gateway_id"]):
-            self._disarm_unhealthy(row, "OUTPUT_DISCONNECTED", "Destination gateway disconnected; output command was not sent. Re-arm after reconnection")
+        if not destination["gateway_id"] or not self.sessions.for_gateway(destination["gateway_id"]):
+            await self._transition_failure_locked(row, "OUTPUT_DISCONNECTED", "Destination gateway is disconnected; output command was not sent", source_failure=False, destination_failure=True, measurement=measurement)
             return
         attempts = int(config.get("retries", 1)) + 1
+        last_error = None
         for attempt in range(attempts):
             try:
                 result = await self.output.set_output(row["destination_node_id"], row["destination_channel"], target,
-                    source=f"PIPELINE:{pipeline_id}", pipeline_id=pipeline_id, timeout_ms=int(config.get("timeout_ms", 2000)))
-                self._set_runtime(pipeline_id, "RUNNING", last_source_value=value,
-                    last_requested_value=target, last_acknowledged_value=result["acknowledged_ma"],
-                    last_success_at=result["updated_at"], last_attempt_at=result["updated_at"], last_error=None, failsafe_attempted=0)
+                    source=f"PIPELINE:{pipeline_id}", pipeline_id=pipeline_id,
+                    write_timeout_ms=int(config.get("timeout_ms", 5000)))
+                self._set_runtime(pipeline_id, "RUNNING", last_source_value=value, last_raw_ma=measurement.get("raw_ma"),
+                    last_calibrated_ma=measurement.get("calibrated_ma"), last_engineering_value=measurement.get("engineering_value"),
+                    source_quality=measurement.get("quality"), last_requested_value=target,
+                    last_acknowledged_value=result["acknowledged_ma"], last_success_at=result["updated_at"],
+                    last_attempt_at=result["updated_at"], last_communication_at=result["updated_at"], last_error=None,
+                    consecutive_write_failures=0, last_failed_target=None, faulted_at=None)
                 return
             except asyncio.CancelledError:
                 raise
+            except OutputOutcomeUnknown as exc:
+                self._record_write_failure(row, target, "WRITE_OUTCOME_UNKNOWN", str(exc), measurement, unknown=True)
+                return
             except Exception as exc:
-                status = "OUTPUT_READBACK_MISMATCH" if "readback mismatch" in str(exc).lower() else "OUTPUT_READBACK_FAILED" if isinstance(exc, OutputReadbackError) else "OUTPUT_WRITE_FAILED"
-                self._set_runtime(pipeline_id, status, last_source_value=value, last_requested_value=target,
-                                  last_attempt_at=utc_now(), last_error=str(exc))
+                last_error = exc
                 if "not connected" in str(exc).lower() or "disconnected" in str(exc).lower():
-                    self._disarm_unhealthy(row, "OUTPUT_DISCONNECTED", f"{exc}; re-arm after reconnection")
+                    await self._transition_failure_locked(row, "OUTPUT_DISCONNECTED", str(exc), source_failure=False, destination_failure=True, measurement=measurement)
                     return
-                if attempt + 1 < attempts and not isinstance(exc, OutputReadbackError):
-                    await asyncio.sleep(min(0.25 * (2 ** attempt), 1.0))
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(int(config.get("write_retry_backoff_ms", 300)) / 1000)
+        if last_error is not None:
+            status = "OUTPUT_READBACK_MISMATCH" if "readback mismatch" in str(last_error).lower() else "OUTPUT_WRITE_FAILED"
+            self._record_write_failure(row, target, status, str(last_error), measurement, unknown=False)
+
+    async def gateway_disconnected(self, gateway_id: str, reason: str, *, operator_initiated=False):
+        rows = self.store.rows("""SELECT DISTINCT p.id,s.gateway_id source_gateway,d.gateway_id destination_gateway
+            FROM mappings p JOIN nodes s ON s.id=p.source_node_id JOIN nodes d ON d.id=p.destination_node_id
+            WHERE p.enabled=1 AND p.armed=1 AND (s.gateway_id=? OR d.gateway_id=?)""", (gateway_id,gateway_id))
+        # Process a bounded number at once. GatewaySession serializes each bus;
+        # this avoids creating a task per affected mapping on a disconnect.
+        for item in rows:
+            source_failed = item["source_gateway"] == gateway_id
+            destination_failed = item["destination_gateway"] == gateway_id
+            label = "operator disconnected" if operator_initiated else "connection lost"
+            detail = f"Gateway {gateway_id} {label}: {reason}"
+            status = "SOURCE_DISCONNECTED" if source_failed else "OUTPUT_DISCONNECTED"
+            if source_failed and destination_failed:
+                status = "SOURCE_DISCONNECTED"
+            await self.transition_failure(item["id"], status, detail,
+                source_failure=source_failed, destination_failure=destination_failed)
+
+    async def transition_failure(self, pipeline_id, status, detail, *, source_failure, destination_failure=False, measurement=None):
+        async with self._pipeline_lock(pipeline_id):
+            row = self.store.one("SELECT * FROM mappings WHERE id=? AND enabled=1 AND armed=1", (pipeline_id,))
+            if not row:
+                return
+            await self._transition_failure_locked(row, status, detail, source_failure=source_failure,
+                destination_failure=destination_failure, measurement=measurement)
+
+    async def _transition_failure_locked(self, row, status, detail, *, source_failure, destination_failure=False, measurement=None):
+        pipeline_id = row["id"]
+        current = self.store.one("SELECT * FROM mappings WHERE id=?", (pipeline_id,))
+        if not current or not current["enabled"] or not current["armed"]:
+            return
+        config = json.loads(current["config_json"] or "{}")
+        policy = config.get("fail_safe_policy", "HOLD_LAST")
+        dest = self.store.one("SELECT gateway_id FROM nodes WHERE id=?", (current["destination_node_id"],))
+        destination_session = self.sessions.for_gateway(dest["gateway_id"]) if dest and dest["gateway_id"] else None
+        source_session = None
+        source = self.store.one("SELECT gateway_id FROM nodes WHERE id=?", (current["source_node_id"],))
+        if source and source["gateway_id"]:
+            source_session = self.sessions.for_gateway(source["gateway_id"])
+        if destination_failure or not destination_session:
+            detail += "; destination communication is unavailable"
+            safe_requested = source_failure and policy == "SAFE_SETPOINT"
+            final_status = "FAILSAFE_UNCONFIRMED" if safe_requested else "OUTPUT_DISCONNECTED"
+            self._finish_fault(current, final_status, detail, failsafe_status="UNCONFIRMED" if safe_requested else "NOT_APPLIED", measurement=measurement)
+            self._log_transition(current, final_status, detail, classification="FAILSAFE_UNCONFIRMED" if safe_requested else "DESTINATION_FAILURE")
+            return
+        if source_failure and policy == "SAFE_SETPOINT" and not current["failsafe_attempted"]:
+            self._set_runtime(pipeline_id, "FAILSAFE_PENDING", failsafe_attempted=1, failsafe_status="PENDING",
+                last_error=detail, last_attempt_at=utc_now(), source_quality=measurement.get("quality") if measurement else "DISCONNECTED")
+            self._log_transition(current, "FAILSAFE_PENDING", detail, classification="FAILSAFE_REQUESTED")
+            safe = float(config.get("safe_setpoint_ma", 0))
+            try:
+                result = await self.output.set_output(current["destination_node_id"], current["destination_channel"], safe,
+                    source=f"PIPELINE_FAILSAFE:{pipeline_id}", pipeline_id=pipeline_id,
+                    write_timeout_ms=int(config.get("timeout_ms", 5000)))
+                confirmed_detail = f"Fail-safe setpoint {safe:.3f} mA was acknowledged and reported by the module; physical current was not measured"
+                self._finish_fault(current, "FAILSAFE_ACKNOWLEDGED", f"{detail}; {confirmed_detail}", failsafe_status="ACKNOWLEDGED",
+                    measurement=measurement, target=safe, acknowledged=result["acknowledged_ma"], at=result["updated_at"])
+                self._log_transition(current, "FAILSAFE_ACKNOWLEDGED", confirmed_detail, classification="FAILSAFE_ACKNOWLEDGED")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                unknown = isinstance(exc, OutputOutcomeUnknown)
+                state = "FAILSAFE_UNCONFIRMED"
+                explanation = f"{detail}; fail-safe request was not confirmed: {exc}"
+                if unknown:
+                    explanation += "; output setpoint may have changed"
+                self._finish_fault(current, state, explanation, failsafe_status="UNCONFIRMED", measurement=measurement, target=safe)
+                self._log_transition(current, state, explanation, classification="FAILSAFE_UNCONFIRMED")
+            return
+        if source_failure and not source_session:
+            detail += "; source gateway is disconnected"
+        fail_status = "SOURCE_DISCONNECTED" if status == "SOURCE_DISCONNECTED" else status
+        self._finish_fault(current, fail_status, detail, failsafe_status="HELD_LAST" if policy == "HOLD_LAST" else "UNCONFIRMED", measurement=measurement)
+        self._log_transition(current, fail_status, detail, classification="SOURCE_FAILURE" if source_failure else "DESTINATION_FAILURE")
+
+    def _finish_fault(self, row, status, detail, *, failsafe_status, measurement=None, target=None, acknowledged=None, at=None):
+        now = at or utc_now()
+        values = {
+            "armed": 0, "status": status, "failsafe_status": failsafe_status, "last_error": detail,
+            "last_attempt_at": now, "updated_at": utc_now(),
+        }
+        if target is not None:
+            values["last_requested_value"] = target
+        if acknowledged is not None:
+            values["last_acknowledged_value"] = acknowledged
+            values["last_success_at"] = now
+            values["last_communication_at"] = now
+        if measurement:
+            values["source_quality"] = measurement.get("quality")
+            values["last_raw_ma"] = measurement.get("raw_ma")
+            values["last_calibrated_ma"] = measurement.get("calibrated_ma")
+            values["last_engineering_value"] = measurement.get("engineering_value")
+        assignments = ",".join(f"{key}=?" for key in values)
+        self.store.run(f"UPDATE mappings SET {assignments} WHERE id=?", (*values.values(), row["id"]))
+        self._next_due.pop(row["id"], None)
+        self.store.audit("PIPELINE_FAULT", "pipeline", row["id"], {"status": status, "detail": detail, "failsafe_status": failsafe_status})
+
+    def _record_write_failure(self, row, target, status, detail, measurement, *, unknown):
+        latest = self.store.one("SELECT consecutive_write_failures,config_json FROM mappings WHERE id=?", (row["id"],))
+        count = int(latest["consecutive_write_failures"] or 0) + 1
+        config = json.loads(latest["config_json"] or "{}")
+        maximum = int(config.get("max_consecutive_write_failures", 3))
+        lockout = unknown or count >= maximum
+        final = "WRITE_OUTCOME_UNKNOWN" if unknown else "OUTPUT_FAULT_LOCKOUT" if count >= maximum else status
+        values = {"consecutive_write_failures": count, "last_failed_target": target, "last_attempt_at": utc_now(),
+                  "last_requested_value": target, "last_error": detail, "status": final,
+                  "faulted_at": utc_now() if lockout else None, "armed": 0 if lockout else 1,
+                  "updated_at": utc_now()}
+        if measurement:
+            values.update({"source_quality": measurement.get("quality"), "last_source_value": self._source_value(measurement, row["source_value_type"]),
+                           "last_raw_ma": measurement.get("raw_ma"), "last_calibrated_ma": measurement.get("calibrated_ma"),
+                           "last_engineering_value": measurement.get("engineering_value")})
+        assignments = ",".join(f"{key}=?" for key in values)
+        self.store.run(f"UPDATE mappings SET {assignments} WHERE id=?", (*values.values(), row["id"]))
+        if lockout:
+            self._next_due.pop(row["id"], None)
+        else:
+            self._next_due[row["id"]] = time.monotonic() + int(config.get("write_retry_backoff_ms", 300)) / 1000
+        self._log_transition(row, final, detail, classification="WRITE_OUTCOME_UNKNOWN" if unknown else "OUTPUT_FAULT")
+
+    def _log_transition(self, row, status, detail, *, classification):
+        self.store.event(status, detail, node_id=row["destination_node_id"], pipeline_id=row["id"],
+            source_node_id=row["source_node_id"], source_channel=row["source_channel"],
+            destination_node_id=row["destination_node_id"], destination_channel=row["destination_channel"],
+            classification=classification)
 
     def _latest_source(self, pipeline, config):
         rows = self.store.rows("SELECT * FROM measurements WHERE node_id=? AND channel=? ORDER BY measured_at DESC,id DESC LIMIT 1", (pipeline["source_node_id"], pipeline["source_channel"]))
@@ -428,40 +614,16 @@ class PipelineService:
             return float(config["output_min_ma"]) + ((float(value) - float(config["input_min"])) / span) * (float(config["output_max_ma"]) - float(config["output_min_ma"]))
         raise PipelineError("Unsupported transformation")
 
-    async def _source_invalid(self, row, config, status, detail):
-        current = self.store.one("SELECT status,failsafe_attempted FROM mappings WHERE id=?", (row["id"],)) or {}
-        self._set_runtime(row["id"], status, last_error=detail)
-        if config.get("fail_safe_policy", "HOLD_LAST") != "SAFE_SETPOINT" or current.get("failsafe_attempted"):
-            return
-        try:
-            safe = float(config["safe_setpoint_ma"])
-            result = await self.output.set_output(row["destination_node_id"], row["destination_channel"], safe,
-                source=f"PIPELINE_FAILSAFE:{row['id']}", pipeline_id=row["id"], timeout_ms=int(config.get("timeout_ms", 2000)))
-            self._set_runtime(row["id"], status, last_requested_value=safe,
-                last_acknowledged_value=result["acknowledged_ma"], last_success_at=result["updated_at"],
-                last_attempt_at=result["updated_at"], last_error=f"{detail}; configured safe setpoint acknowledged",
-                failsafe_attempted=1)
-        except Exception as exc:
-            disconnected = "not connected" in str(exc).lower() or "disconnected" in str(exc).lower()
-            self._set_runtime(row["id"], "OUTPUT_DISCONNECTED" if disconnected else status,
-                last_attempt_at=utc_now(), last_error=f"{detail}; safe setpoint was not confirmed: {exc}", failsafe_attempted=1)
-            if disconnected:
-                self._disarm_unhealthy(row, "OUTPUT_DISCONNECTED", "Safe setpoint could not be applied because the destination gateway is disconnected; re-arm after reconnection")
-
-    def _disarm_unhealthy(self, row, status, detail):
-        with self.store.transaction() as db:
-            db.execute("UPDATE mappings SET armed=0,status=?,last_error=?,updated_at=? WHERE id=?", (status, detail, utc_now(), row["id"]))
-        self._next_due.pop(row["id"], None)
-        self.store.audit("AUTO_DISARM", "pipeline", row["id"], {"status": status, "reason": detail})
-
     def _set_runtime(self, pipeline_id, status, **values):
-        allowed = {"last_source_value", "last_requested_value", "last_acknowledged_value", "last_success_at", "last_attempt_at", "last_error", "failsafe_attempted"}
+        allowed = {"last_source_value", "last_raw_ma", "last_calibrated_ma", "last_engineering_value", "source_quality",
+                   "last_requested_value", "last_acknowledged_value", "last_success_at", "last_attempt_at", "last_communication_at",
+                   "last_error", "failsafe_attempted", "failsafe_status", "consecutive_write_failures", "last_failed_target", "faulted_at"}
         if set(values) - allowed:
             raise ValueError("unsupported runtime field")
         values["status"] = status
         values["updated_at"] = utc_now()
         assignments = ",".join(f"{key}=?" for key in values)
-        self.store.run(f"UPDATE mappings SET {assignments} WHERE id=?", (*[int(v) if k == "failsafe_attempted" else v for k,v in values.items()], pipeline_id))
+        self.store.run(f"UPDATE mappings SET {assignments} WHERE id=?", (*[int(v) if k in {"failsafe_attempted", "consecutive_write_failures"} else v for k,v in values.items()], pipeline_id))
 
     @staticmethod
     def _age_seconds(value):
