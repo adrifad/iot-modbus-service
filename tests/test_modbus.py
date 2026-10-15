@@ -1,0 +1,72 @@
+import unittest
+
+from backend.modbus import (
+    ModbusError, ModbusExceptionResponse, StreamFrames, build_request, decode_registers,
+    crc16, decode_response, with_crc,
+)
+
+
+class ModbusCodecTests(unittest.TestCase):
+    def test_build_modbus_tcp_fc04_request(self):
+        self.assertEqual(build_request("MODBUS_TCP", 1, 4, 0x0064, 6, 0x1234),
+                         bytes.fromhex("12 34 00 00 00 06 01 04 00 64 00 06"))
+
+    def test_build_rtu_request_with_crc(self):
+        request = build_request("MODBUS_RTU", 1, 4, 0x0064, 1)
+        self.assertEqual(request[:6], bytes.fromhex("01 04 00 64 00 01"))
+        self.assertEqual(int.from_bytes(request[-2:], "little"), crc16(request[:-2]))
+
+    def test_tcp_stream_handles_fragmentation_and_concatenation(self):
+        parser = StreamFrames.create("MODBUS_TCP")
+        first = bytes.fromhex("00 01 00 00 00 05 01 04 02 03 e8")
+        second = bytes.fromhex("00 02 00 00 00 05 01 04 02 07 d0")
+        self.assertEqual(parser.push(first[:4]), [])
+        self.assertEqual(parser.push(first[4:] + second), [first, second])
+
+    def test_rtu_stream_handles_fragmentation_and_concatenation(self):
+        parser = StreamFrames.create("TRANSPARENT_SERIAL")
+        first = with_crc(bytes.fromhex("01 04 02 03 e8"))
+        second = with_crc(bytes.fromhex("01 04 02 07 d0"))
+        self.assertEqual(parser.push(first[:3]), [])
+        self.assertEqual(parser.push(first[3:] + second), [first, second])
+
+    def test_decode_tcp_register_response_and_check_transaction(self):
+        frame = bytes.fromhex("12 34 00 00 00 07 01 04 04 00 00 61 a8")
+        self.assertEqual(decode_response("MODBUS_TCP", frame, unit_id=1, function_code=4,
+                                         quantity=2, transaction_id=0x1234), [0, 25000])
+        with self.assertRaisesRegex(ModbusError, "transaction"):
+            decode_response("MODBUS_TCP", frame, unit_id=1, function_code=4,
+                            quantity=2, transaction_id=0x9999)
+
+    def test_decode_rtu_register_response_and_crc(self):
+        frame = with_crc(bytes.fromhex("01 04 02 61 a8"))
+        self.assertEqual(decode_response("MODBUS_RTU", frame, unit_id=1,
+                                         function_code=4, quantity=1), [25000])
+        broken = frame[:-1] + bytes((frame[-1] ^ 1,))
+        with self.assertRaisesRegex(ModbusError, "CRC"):
+            decode_response("MODBUS_RTU", broken, unit_id=1, function_code=4, quantity=1)
+
+    def test_modbus_exception_is_not_accepted_as_measurement(self):
+        frame = bytes.fromhex("00 01 00 00 00 03 01 84 02")
+        with self.assertRaises(ModbusExceptionResponse) as caught:
+            decode_response("MODBUS_TCP", frame, unit_id=1, function_code=4,
+                            quantity=1, transaction_id=1)
+        self.assertEqual(caught.exception.exception_code, 2)
+
+    def test_wrong_unit_and_byte_count_are_rejected(self):
+        with self.assertRaisesRegex(ModbusError, "unit"):
+            decode_response("MODBUS_TCP", bytes.fromhex("00 01 00 00 00 05 02 04 02 00 01"),
+                            unit_id=1, function_code=4, quantity=1, transaction_id=1)
+
+    def test_float32_word_order_is_explicit(self):
+        self.assertEqual(decode_registers([0x4148, 0x0000], "float32"), 12.5)
+        self.assertEqual(decode_registers([0x0000, 0x4148], "float32", word_order="LITTLE_WORD_FIRST"), 12.5)
+        with self.assertRaisesRegex(ModbusError, "not verified"):
+            decode_registers([0x4148, 0x0000], "float32", word_order="unverified")
+        with self.assertRaisesRegex(ModbusError, "byte count"):
+            decode_response("MODBUS_TCP", bytes.fromhex("00 01 00 00 00 04 01 04 01 00"),
+                            unit_id=1, function_code=4, quantity=1, transaction_id=1)
+
+
+if __name__ == "__main__":
+    unittest.main()

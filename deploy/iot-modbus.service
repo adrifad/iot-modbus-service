@@ -1,0 +1,24 @@
+[Unit]
+Description=Industrial Modbus I/O Monitoring Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iotmodbus
+Group=iotmodbus
+WorkingDirectory=/opt/iot-modbus-service
+EnvironmentFile=/etc/iot-modbus-service.env
+ExecStart=/opt/iot-modbus-service/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/iot-modbus-service
+StateDirectory=iot-modbus-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
