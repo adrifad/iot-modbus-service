@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 
 from .output import OutputOutcomeUnknown
+from .node_lifecycle import NodeOperationError
 from .store import utc_now
 
 
@@ -129,8 +130,8 @@ class PipelineService:
         name = data["name"].strip()
         if not name or len(name) > 100:
             raise PipelineError("Pipeline name must be 1–100 characters")
-        src = self.store.one("SELECT * FROM nodes WHERE id=?", (data["source_node_id"],))
-        dst = self.store.one("SELECT * FROM nodes WHERE id=?", (data["destination_node_id"],))
+        src = self.store.one("SELECT * FROM nodes WHERE id=? AND archived_at IS NULL", (data["source_node_id"],))
+        dst = self.store.one("SELECT * FROM nodes WHERE id=? AND archived_at IS NULL", (data["destination_node_id"],))
         if not src or src["node_type"] != "ANALOG_INPUT" or src["profile_id"] != "ebyte-me31-xaxx0600-v1.1":
             raise PipelineError("Source must be a registered ME31-XAXX0600 input node")
         if not dst or dst["node_type"] != "ANALOG_OUTPUT" or dst["profile_id"] != "ebyte-me31-xxxa0006-v1.1":
@@ -372,10 +373,16 @@ class PipelineService:
 
     async def execute(self, pipeline_id):
         async with self._pipeline_lock(pipeline_id):
-            row = self.store.one("SELECT * FROM mappings WHERE id=? AND enabled=1 AND armed=1", (pipeline_id,))
+            row = self.store.one("""SELECT p.* FROM mappings p JOIN nodes s ON s.id=p.source_node_id
+                JOIN nodes d ON d.id=p.destination_node_id
+                WHERE p.id=? AND p.enabled=1 AND p.armed=1 AND s.archived_at IS NULL AND d.archived_at IS NULL""", (pipeline_id,))
             if not row:
                 return
-            await self._execute_locked(row)
+            try:
+                async with self.output.operations.operation(row["source_node_id"], row["destination_node_id"]):
+                    await self._execute_locked(row)
+            except NodeOperationError:
+                return
 
     async def _execute_locked(self, row):
         pipeline_id = row["id"]

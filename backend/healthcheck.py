@@ -5,6 +5,7 @@ import os
 import time
 
 from .store import utc_now
+from .node_lifecycle import NodeOperationError
 
 
 def _int_env(name, default, minimum, maximum):
@@ -83,7 +84,7 @@ class GatewayHealthMonitor:
         # extra probe. This avoids competing with useful Modbus traffic.
         if session.last_request_at and time.perf_counter() - session.last_request_at < self.interval:
             return
-        nodes = self.store.rows("SELECT * FROM nodes WHERE gateway_id=? AND polling_enabled=1 ORDER BY id", (gateway_id,))
+        nodes = self.store.rows("SELECT * FROM nodes WHERE gateway_id=? AND polling_enabled=1 AND archived_at IS NULL ORDER BY id", (gateway_id,))
         if not nodes:
             return
         self.in_flight.add(key)
@@ -95,7 +96,8 @@ class GatewayHealthMonitor:
                 if node["node_type"] == "ANALOG_INPUT":
                     if session.transport_mode != "MODBUS_TCP":
                         raise ConnectionError("Input ME31 health check requires MODBUS_TCP framing")
-                    values, frame, request, latency = await session.read_registers(node["slave_id"], 4, 0x0064, 6, self.timeout_ms)
+                    async with self.output.operations.operation(node["id"]):
+                        values, frame, request, latency = await session.read_registers(node["slave_id"], 4, 0x0064, 6, self.timeout_ms)
                     detail = f"Read-only FC04 AI1-AI6 health check returned {len(values)} registers"
                     self.store.event("GATEWAY_HEALTHCHECK_RECOVERED" if previous_failures else "GATEWAY_HEALTHCHECK_OK", detail, gateway_id=gateway_id, node_id=node["id"], protocol=session.transport_mode,
                                      function_code=4, address=0x0064, quantity=6, latency_ms=latency, request_hex=request.hex(" "), response_hex=frame.hex(" "),session_id=session.session_id,session_generation=session.generation,identity_method=getattr(session,"commissioning_method",None),peer=getattr(session,"peer",None))
@@ -109,6 +111,8 @@ class GatewayHealthMonitor:
             self.failures[key] = 0
         except asyncio.CancelledError:
             raise
+        except NodeOperationError:
+            return
         except Exception as exc:
             count = self.failures.get(key, 0) + 1
             self.failures[key] = count

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from backend import app as service
 from backend.gateway import GatewaySession
+from backend.node_lifecycle import NodeOperationGate
 from backend.store import Store
 
 
@@ -21,9 +22,13 @@ class ApiTests(unittest.TestCase):
             if service.store is not database:
                 service.store.close()
             service.store = database
+            service.node_operations = NodeOperationGate(database)
+            service.scheduler.operations = service.node_operations
+            service.scheduler.paused_nodes.clear()
             service.scheduler.store = database
             service.sessions.store = database
             service.output_driver.store = database
+            service.output_driver.operations = service.node_operations
             service.pipelines.store = database
             token = "test-administrator-token"
             with patch.dict(os.environ, {"ADMIN_API_TOKEN": token, "TCP_LISTEN_HOST": "127.0.0.1", "TCP_LISTEN_PORT": "0"}):
@@ -206,10 +211,13 @@ class ApiTests(unittest.TestCase):
                 try: service.store.close()
                 except Exception: pass
             service.store=database
+            service.node_operations=NodeOperationGate(database)
+            service.scheduler.operations=service.node_operations
+            service.scheduler.paused_nodes.clear()
             service.scheduler.store=database
             service.sessions.store=database
             service.sessions.sessions.clear();service.sessions.tasks.clear();service.sessions.by_gateway.clear()
-            service.output_driver.store=database;service.pipelines.store=database
+            service.output_driver.store=database;service.output_driver.operations=service.node_operations;service.pipelines.store=database
             token="test-pipeline-administrator-token"
             with patch.dict(os.environ,{"ADMIN_API_TOKEN":token,"TCP_LISTEN_HOST":"127.0.0.1","TCP_LISTEN_PORT":"0"}):
                 with TestClient(service.app) as client:
@@ -272,6 +280,72 @@ class ApiTests(unittest.TestCase):
                     self.assertIsNone(service.sessions.for_gateway(unused["id"]))
                     self.assertEqual(client.delete(f"/api/gateways/{unused['id']}",headers=headers).status_code,204)
                     self.assertIsNone(database.one("SELECT id FROM gateways WHERE id=?",(unused["id"],)))
+
+    def test_node_archive_blocks_pipeline_dependencies_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database=Store(os.path.join(temp,"archive.db"))
+            try: service.store.close()
+            except Exception: pass
+            service.store=database
+            service.node_operations=NodeOperationGate(database)
+            service.scheduler.store=database
+            service.scheduler.operations=service.node_operations
+            service.scheduler.paused_nodes.clear()
+            service.output_driver.store=database
+            service.output_driver.operations=service.node_operations
+            service.pipelines.store=database
+            service.sessions.store=database
+            service.sessions.sessions.clear();service.sessions.tasks.clear();service.sessions.by_gateway.clear()
+            token="archive-test-admin-token"
+            now=datetime.now(timezone.utc).isoformat()
+            with patch.dict(os.environ,{"ADMIN_API_TOKEN":token,"TCP_LISTEN_HOST":"127.0.0.1","TCP_LISTEN_PORT":"0"}):
+                with TestClient(service.app) as client:
+                    headers={"Authorization":f"Bearer {token}"}
+                    input_gateway=client.post("/api/gateways",headers=headers,json={"name":"Archive G781","model":"USR-G781","transport_mode":"MODBUS_TCP"}).json()
+                    output_gateway=client.post("/api/gateways",headers=headers,json={"name":"Archive W630","model":"USR-W630","transport_mode":"TRANSPARENT_SERIAL"}).json()
+                    input_node=client.post("/api/nodes",headers=headers,json={"name":"Archive AI","node_type":"ANALOG_INPUT","gateway_id":input_gateway["id"]}).json()
+                    output_node=client.post("/api/nodes",headers=headers,json={"name":"Archive AO","node_type":"ANALOG_OUTPUT","gateway_id":output_gateway["id"]}).json()
+                    database.run("INSERT INTO measurements(node_id,channel,register_value,raw_registers_json,raw_ma,calibrated_ma,quality,measured_at) VALUES(?,1,12000,'[12000]',12.0,12.1,'GOOD',?)",(input_node["id"],now))
+                    database.run("INSERT INTO calibrations(node_id,channel,revision,gain,offset_ma,enabled,method,modified_by,created_at) VALUES(?,1,1,1.01,0.1,1,'GAIN_OFFSET','admin',?)",(input_node["id"],now))
+                    database.run("INSERT INTO output_commands(at,node_id,channel,source,target_ma,readback_ma,result,detail) VALUES(?,?,2,'MANUAL:test',12.5,12.5,'ACKNOWLEDGED','fixture')",(now,output_node["id"]))
+                    definition={"name":"AI1 to AO2 archive guard","source_node_id":input_node["id"],"source_channel":1,
+                        "destination_node_id":output_node["id"],"destination_channel":2,"source_value_type":"CALIBRATED_MA",
+                        "config":{"transformation":"DIRECT","update_interval_ms":1000,"deadband_ma":0.05,"stale_timeout_ms":10000,"timeout_ms":2000,"retries":0,"fail_safe_policy":"HOLD_LAST"}}
+                    created=client.post("/api/pipelines",headers=headers,json=definition)
+                    self.assertEqual(created.status_code,201,created.text)
+                    pipeline_id=created.json()["id"]
+                    for node in (input_node,output_node):
+                        response=client.delete(f"/api/nodes/{node['id']}",headers=headers)
+                        self.assertEqual(response.status_code,409,response.text)
+                        detail=response.json()["detail"]
+                        self.assertEqual(detail["code"],"NODE_HAS_PIPELINES")
+                        self.assertEqual(detail["dependencies"][0]["id"],pipeline_id)
+                        self.assertFalse(detail["dependencies"][0]["enabled"])
+                    self.assertEqual(client.delete("/api/nodes/missing-node",headers=headers).status_code,404)
+                    self.assertEqual(client.delete(f"/api/pipelines/{pipeline_id}",headers=headers).status_code,204)
+                    for node in (input_node,output_node):
+                        response=client.delete(f"/api/nodes/{node['id']}",headers=headers)
+                        self.assertEqual(response.status_code,204,response.text)
+                        self.assertEqual(client.delete(f"/api/nodes/{node['id']}",headers=headers).status_code,409)
+                        self.assertEqual(client.patch(f"/api/nodes/{node['id']}",headers=headers,json={"polling_enabled":True}).status_code,409)
+                    self.assertEqual(client.get("/api/nodes",headers=headers).json(),[])
+                    archived=client.get("/api/nodes?include_archived=true",headers=headers).json()
+                    self.assertEqual({node["id"] for node in archived},{input_node["id"],output_node["id"]})
+                    self.assertEqual(client.get("/api/overview",headers=headers).json()["inputs"]["total"],0)
+                    self.assertEqual(len(client.get(f"/api/nodes/{input_node['id']}/measurements/history",headers=headers).json()),1)
+                    self.assertEqual(len(client.get(f"/api/nodes/{input_node['id']}/calibration",headers=headers).json()),1)
+                    self.assertEqual(database.one("SELECT COUNT(*) count FROM output_commands WHERE node_id=?",(output_node["id"],))["count"],1)
+                    self.assertEqual(client.get(f"/api/nodes/{output_node['id']}/outputs",headers=headers).status_code,409)
+                    manual=client.post(f"/api/nodes/{output_node['id']}/outputs/2/set",headers=headers,json={"target_ma":0,"confirm":True})
+                    self.assertEqual(manual.status_code,409)
+                    self.assertEqual(database.one("SELECT COUNT(*) count FROM output_commands WHERE node_id=?",(output_node["id"],))["count"],1)
+                    archived_pipeline=client.post("/api/pipelines",headers=headers,json={**definition,"name":"Archived nodes must be rejected"})
+                    self.assertIn(archived_pipeline.status_code,(409,422))
+                    self.assertEqual(database.one("SELECT COUNT(*) count FROM audit_log WHERE entity_type='node' AND entity_id IN (?,?) AND action='ARCHIVE'",(input_node["id"],output_node["id"]))["count"],2)
+                    self.assertIsNotNone(database.one("SELECT archived_at FROM nodes WHERE id=?",(input_node["id"],))["archived_at"])
+                    self.assertIsNotNone(database.one("SELECT id FROM gateways WHERE id=?",(output_gateway["id"],)))
+                    self.assertEqual(client.delete(f"/api/gateways/{output_gateway['id']}",headers=headers).status_code,204)
+                    self.assertIsNone(database.one("SELECT gateway_id FROM nodes WHERE id=?",(output_node["id"],))["gateway_id"])
 
 
 if __name__ == "__main__":

@@ -256,6 +256,92 @@ class Store:
         if migration < 13:
             self._ensure_column("mappings", "last_output_verified_setpoint_ma", "REAL")
             self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(13,?)", (utc_now(),))
+            migration = 13
+        if migration < 14:
+            for name, declaration in (
+                ("archived_at", "TEXT"),
+                ("archived_by", "TEXT"),
+                ("archive_reason", "TEXT"),
+            ):
+                self._ensure_column("nodes", name, declaration)
+            self.db.executescript("""
+                CREATE INDEX IF NOT EXISTS nodes_active_type_name ON nodes(archived_at,node_type,name);
+
+                CREATE TRIGGER IF NOT EXISTS nodes_prevent_physical_delete
+                BEFORE DELETE ON nodes
+                BEGIN SELECT RAISE(ABORT, 'nodes must be archived, not physically deleted'); END;
+
+                CREATE TRIGGER IF NOT EXISTS nodes_archive_requires_no_pipeline
+                BEFORE UPDATE OF archived_at ON nodes
+                WHEN OLD.archived_at IS NULL AND NEW.archived_at IS NOT NULL
+                 AND EXISTS(SELECT 1 FROM mappings WHERE source_node_id=OLD.id OR destination_node_id=OLD.id)
+                BEGIN SELECT RAISE(ABORT, 'remove dependent pipelines before archiving this node'); END;
+
+                CREATE TRIGGER IF NOT EXISTS nodes_prevent_reenable_when_archived
+                BEFORE UPDATE OF polling_enabled ON nodes
+                WHEN OLD.archived_at IS NOT NULL AND NEW.polling_enabled <> 0
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot be re-enabled'); END;
+
+                CREATE TRIGGER IF NOT EXISTS mappings_reject_archived_node_insert
+                BEFORE INSERT ON mappings
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.source_node_id AND archived_at IS NOT NULL)
+                  OR EXISTS(SELECT 1 FROM nodes WHERE id=NEW.destination_node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'pipeline nodes must be active'); END;
+
+                CREATE TRIGGER IF NOT EXISTS mappings_reject_archived_node_update
+                BEFORE UPDATE OF source_node_id,destination_node_id ON mappings
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.source_node_id AND archived_at IS NOT NULL)
+                  OR EXISTS(SELECT 1 FROM nodes WHERE id=NEW.destination_node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'pipeline nodes must be active'); END;
+
+                CREATE TRIGGER IF NOT EXISTS mappings_reject_archived_node_enable
+                BEFORE UPDATE OF enabled,armed ON mappings
+                WHEN (NEW.enabled <> 0 OR NEW.armed <> 0)
+                 AND (EXISTS(SELECT 1 FROM nodes WHERE id=NEW.source_node_id AND archived_at IS NOT NULL)
+                   OR EXISTS(SELECT 1 FROM nodes WHERE id=NEW.destination_node_id AND archived_at IS NOT NULL))
+                BEGIN SELECT RAISE(ABORT, 'pipeline nodes must be active'); END;
+
+                CREATE TRIGGER IF NOT EXISTS polling_reject_archived_node_insert
+                BEFORE INSERT ON polling_items
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot be polled'); END;
+
+                CREATE TRIGGER IF NOT EXISTS polling_reject_archived_node_update
+                BEFORE UPDATE OF node_id,enabled ON polling_items
+                WHEN NEW.enabled <> 0 AND EXISTS(SELECT 1 FROM nodes WHERE id=NEW.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot be polled'); END;
+
+                CREATE TRIGGER IF NOT EXISTS channels_reject_archived_node_insert
+                BEFORE INSERT ON channels
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot receive channel configuration'); END;
+
+                CREATE TRIGGER IF NOT EXISTS channels_reject_archived_node_update
+                BEFORE UPDATE ON channels
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=OLD.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived node channels are read-only'); END;
+
+                CREATE TRIGGER IF NOT EXISTS measurements_reject_archived_node_insert
+                BEFORE INSERT ON measurements
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot receive measurements'); END;
+
+                CREATE TRIGGER IF NOT EXISTS calibrations_reject_archived_node_insert
+                BEFORE INSERT ON calibrations
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot be calibrated'); END;
+
+                CREATE TRIGGER IF NOT EXISTS calibrations_reject_archived_node_update
+                BEFORE UPDATE ON calibrations
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=OLD.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived calibration history is read-only'); END;
+
+                CREATE TRIGGER IF NOT EXISTS output_commands_reject_archived_node_insert
+                BEFORE INSERT ON output_commands
+                WHEN EXISTS(SELECT 1 FROM nodes WHERE id=NEW.node_id AND archived_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'archived nodes cannot receive output commands'); END;
+            """)
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(14,?)", (utc_now(),))
         from .profiles import PROFILES
         for profile in PROFILES:
             self.db.execute("INSERT OR IGNORE INTO device_profiles(id,name,definition_json,created_at) VALUES(?,?,?,?)",

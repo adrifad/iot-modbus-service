@@ -18,13 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .gateway import GatewaySession
 from .healthcheck import GatewayHealthMonitor
+from .node_lifecycle import NodeBusyError, NodeOperationError, NodeOperationGate
 from .modbus import decode_registers
 from .output import OutputDriver, OutputError
 from .pipelines import PipelineError, PipelineService
@@ -97,8 +98,9 @@ class SessionRegistry:
 
 store = Store()
 sessions = SessionRegistry(store)
-scheduler = PollScheduler(store, sessions)
-output_driver = OutputDriver(store, sessions)
+node_operations = NodeOperationGate(store)
+scheduler = PollScheduler(store, sessions, node_operations)
+output_driver = OutputDriver(store, sessions, node_operations)
 pipelines = PipelineService(store, sessions, output_driver)
 health_monitor = GatewayHealthMonitor(store, sessions, output_driver)
 tcp_server = None
@@ -138,6 +140,15 @@ async def on_gateway_modbus_success(session, latency_ms):
     updated = store.run("UPDATE gateways SET last_successful_modbus_at=?,last_modbus_generation=?,last_activity_at=?,connection_state='CONNECTED',updated_at=? WHERE id=? AND last_session_id=?", (now,session.generation,now,now,session.gateway_id,session.session_id))
     if updated.rowcount and previous and previous["connection_state"] != "CONNECTED":
         store.event("GATEWAY_MODBUS_HEALTHY", f"Validated Modbus response on session generation {session.generation}", gateway_id=session.gateway_id, protocol=session.transport_mode, latency_ms=latency_ms,session_id=session.session_id,session_generation=session.generation,identity_method=session.commissioning_method,peer=session.peer)
+
+
+def require_active_node(node_id: str):
+    node = store.one("SELECT * FROM nodes WHERE id=?", (node_id,))
+    if not node:
+        raise HTTPException(404, "Node not found")
+    if node.get("archived_at") is not None:
+        raise HTTPException(409, {"code": "NODE_ARCHIVED", "message": "Archived nodes are read-only and cannot be operated."})
+    return node
 
 
 def _peer_allowed_for_identity(session):
@@ -666,9 +677,9 @@ async def health():
 
 @app.get("/api/overview")
 async def overview(_: str = Depends(authorize)):
-    nodes = store.rows("SELECT * FROM nodes ORDER BY name")
+    nodes = store.rows("SELECT * FROM nodes WHERE archived_at IS NULL ORDER BY name")
     gateways = store.rows("SELECT * FROM gateways")
-    latest = store.one("SELECT MAX(measured_at) AS at FROM measurements")
+    latest = store.one("SELECT MAX(m.measured_at) AS at FROM measurements m JOIN nodes n ON n.id=m.node_id WHERE n.archived_at IS NULL")
     connected_gateway_ids = {gateway["id"] for gateway in gateways if sessions.for_gateway(gateway["id"])}
     counts = {}
     for kind in ("ANALOG_INPUT", "ANALOG_OUTPUT"):
@@ -677,7 +688,7 @@ async def overview(_: str = Depends(authorize)):
         assigned=sum(node["gateway_id"] is not None for node in typed)
         counts[kind.lower()] = {"total": len(typed), "connected": gateways_connected, "disconnected": assigned-gateways_connected,
                                 "unassigned":len(typed)-assigned,"gateway_connected":gateways_connected,"modbus_responding":0,"unhealthy":0,"health_unknown":0}
-    item_stats = store.one("SELECT SUM(CASE WHEN p.enabled=1 AND n.polling_enabled=1 THEN 1 ELSE 0 END) active FROM polling_items p JOIN nodes n ON n.id=p.node_id") or {}
+    item_stats = store.one("SELECT SUM(CASE WHEN p.enabled=1 AND n.polling_enabled=1 AND n.archived_at IS NULL THEN 1 ELSE 0 END) active FROM polling_items p JOIN nodes n ON n.id=p.node_id") or {}
     event_stats = store.one("SELECT SUM(CASE WHEN result IN ('SUCCESS','FLOAT_VERIFIED') THEN 1 ELSE 0 END) successful,SUM(CASE WHEN result IN ('TIMEOUT','DISCONNECTED','INVALID_RESPONSE','MODBUS_ERROR','DECODE_ERROR','POLL_ERROR','MEASUREMENT_PROCESSING_ERROR') THEN 1 ELSE 0 END) failed,AVG(CASE WHEN result='SUCCESS' THEN latency_ms END) avg_latency_ms FROM events") or {}
     node_summary = []
     for node in nodes:
@@ -828,7 +839,7 @@ async def patch_gateway(gateway_id: str, data: GatewayPatch, actor=Depends(autho
     if "transport_mode" in changes and changes["transport_mode"] != existing["transport_mode"]:
         if sessions.for_gateway(gateway_id):
             raise HTTPException(409,"Disconnect the commissioned session before changing transport framing")
-        assigned = store.rows("SELECT id,node_type FROM nodes WHERE gateway_id=?", (gateway_id,))
+        assigned = store.rows("SELECT id,node_type FROM nodes WHERE gateway_id=? AND archived_at IS NULL", (gateway_id,))
         expected = {"ANALOG_INPUT": "MODBUS_TCP", "ANALOG_OUTPUT": "TRANSPARENT_SERIAL"}
         incompatible = [node["id"] for node in assigned if expected.get(node["node_type"]) != changes["transport_mode"]]
         if incompatible:
@@ -873,7 +884,7 @@ async def delete_gateway(gateway_id: str, actor=Depends(authorize)):
     gateway = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
     if not gateway:
         raise HTTPException(404, "Gateway not found")
-    nodes = store.rows("SELECT id,name,node_type FROM nodes WHERE gateway_id=? ORDER BY name", (gateway_id,))
+    nodes = store.rows("SELECT id,name,node_type FROM nodes WHERE gateway_id=? AND archived_at IS NULL ORDER BY name", (gateway_id,))
     pipelines_for_gateway = store.rows("""SELECT DISTINCT p.id,p.name,p.enabled,p.armed FROM mappings p
         JOIN nodes s ON s.id=p.source_node_id OR s.id=p.destination_node_id
         WHERE s.gateway_id=? ORDER BY p.name""", (gateway_id,))
@@ -927,8 +938,10 @@ async def assign_session(session_id: str, gateway_id: str, actor=Depends(authori
 
 
 @app.get("/api/nodes")
-async def list_nodes(type: str | None = Query(default=None), search: str | None = None, _: str = Depends(authorize)):
-    nodes = store.rows("SELECT * FROM nodes ORDER BY name")
+async def list_nodes(type: str | None = Query(default=None), search: str | None = None,
+                     include_archived: bool = Query(default=False), _: str = Depends(authorize)):
+    where = "" if include_archived else "WHERE archived_at IS NULL"
+    nodes = store.rows(f"SELECT * FROM nodes {where} ORDER BY name")
     connected = {gateway_id for gateway_id in sessions.by_gateway if sessions.for_gateway(gateway_id)}
     for node in nodes:
         node["enabled_channel_count"] = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1",(node["id"],))["count"]
@@ -984,7 +997,64 @@ async def get_node(node_id: str, _: str = Depends(authorize)):
         raise HTTPException(404,"Node not found")
     node["polling_items"] = store.rows("SELECT * FROM polling_items WHERE node_id=? ORDER BY register_name",(node_id,))
     node["latest_measurements"] = store.rows("SELECT * FROM measurements WHERE node_id=? ORDER BY channel",(node_id,))
+    node["channels"] = store.rows("SELECT * FROM channels WHERE node_id=? ORDER BY channel_type,channel_index",(node_id,))
     return node
+
+
+@app.delete("/api/nodes/{node_id}", status_code=204)
+async def archive_node(node_id: str, actor=Depends(authorize)):
+    node = store.one("SELECT * FROM nodes WHERE id=?", (node_id,))
+    if not node:
+        raise HTTPException(404, "Node not found")
+    if node.get("archived_at") is not None:
+        raise HTTPException(409, {"code": "NODE_ALREADY_ARCHIVED", "message": "This node is already archived."})
+
+    def dependencies():
+        return store.rows("""SELECT id,name,enabled,armed FROM mappings
+            WHERE source_node_id=? OR destination_node_id=? ORDER BY name,id""", (node_id,node_id))
+
+    refs = dependencies()
+    if refs:
+        raise HTTPException(409, {"code":"NODE_HAS_PIPELINES",
+            "message":"Remove dependent pipelines before deleting this node.",
+            "dependencies":[{"id":row["id"],"name":row["name"],"enabled":bool(row["enabled"]),"armed":bool(row["armed"])} for row in refs]})
+
+    try:
+        timeout = min(120.0, max(1.0, float(os.getenv("NODE_ARCHIVE_TIMEOUT_SECONDS", "20"))))
+    except (TypeError, ValueError):
+        timeout = 20.0
+    archived = False
+    pause_owned = node_id not in scheduler.paused_nodes
+    scheduler.pause_node(node_id)
+    try:
+        await node_operations.begin_archive(node_id, timeout)
+        with store.transaction() as db:
+            current = db.execute("SELECT archived_at FROM nodes WHERE id=?", (node_id,)).fetchone()
+            if not current:
+                raise HTTPException(404, "Node not found")
+            if current["archived_at"] is not None:
+                raise HTTPException(409, {"code":"NODE_ALREADY_ARCHIVED","message":"This node is already archived."})
+            refs = db.execute("SELECT id,name,enabled,armed FROM mappings WHERE source_node_id=? OR destination_node_id=? ORDER BY name,id", (node_id,node_id)).fetchall()
+            if refs:
+                raise HTTPException(409, {"code":"NODE_HAS_PIPELINES",
+                    "message":"Remove dependent pipelines before deleting this node.",
+                    "dependencies":[{"id":row["id"],"name":row["name"],"enabled":bool(row["enabled"]),"armed":bool(row["armed"])} for row in refs]})
+            now = utc_now()
+            changed = db.execute("UPDATE nodes SET archived_at=?,archived_by=?,archive_reason=?,polling_enabled=0,updated_at=? WHERE id=? AND archived_at IS NULL",
+                (now,actor,"Archived by operator; physical device state was not changed",now,node_id)).rowcount
+            if changed != 1:
+                raise HTTPException(409, {"code":"NODE_ARCHIVE_RACE","message":"Node state changed while archival was waiting; refresh and retry."})
+            db.execute("UPDATE polling_items SET enabled=0,last_status='DISABLED',updated_at=? WHERE node_id=?", (now,node_id))
+            db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",
+                (now,actor,"ARCHIVE","node",node_id,json.dumps({"name":node["name"],"hardware_model":node["hardware_model"],"gateway_id":node["gateway_id"],"archive_reason":"Operator archive; history preserved; no hardware reset or output command"},sort_keys=True)))
+        archived = True
+        return Response(status_code=204)
+    except NodeBusyError as exc:
+        raise HTTPException(409, {"code":"NODE_BUSY","message":str(exc)}) from exc
+    finally:
+        await node_operations.finish_archive(node_id, archived=archived)
+        if not archived and pause_owned:
+            scheduler.resume_node(node_id)
 
 
 @app.get("/api/nodes/{node_id}/channels")
@@ -996,8 +1066,7 @@ async def get_channels(node_id: str, _: str = Depends(authorize)):
 
 @app.post("/api/nodes/{node_id}/channels",status_code=201)
 async def create_output_channel(node_id: str, data: ChannelCreate, actor=Depends(authorize)):
-    node=store.one("SELECT id,node_type FROM nodes WHERE id=?",(node_id,))
-    if not node: raise HTTPException(404,"Node not found")
+    node=require_active_node(node_id)
     if node["node_type"]!="ANALOG_OUTPUT": raise HTTPException(422,"Input channels are defined by the input device profile")
     raise HTTPException(409,"ME31-XXXA0006 nodes always contain six provisioned AO channels; edit an existing channel label instead")
 
@@ -1006,6 +1075,7 @@ async def create_output_channel(node_id: str, data: ChannelCreate, actor=Depends
 async def patch_channel(channel_id: str, changes: dict, actor=Depends(authorize)):
     channel=store.one("SELECT * FROM channels WHERE id=?",(channel_id,))
     if not channel: raise HTTPException(404,"Channel not found")
+    require_active_node(channel["node_id"])
     if set(changes)-{"label","enabled","config"}: raise HTTPException(422,"Unsupported channel fields")
     if "label" in changes and (not isinstance(changes["label"],str) or not changes["label"].strip() or len(changes["label"])>80): raise HTTPException(422,"Channel label must be 1–80 characters")
     if "config" in changes and not isinstance(changes["config"],dict): raise HTTPException(422,"Channel config must be an object")
@@ -1028,6 +1098,8 @@ async def patch_node(node_id: str, changes: dict, actor=Depends(authorize)):
     existing = store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
     if not existing:
         raise HTTPException(404,"Node not found")
+    if existing.get("archived_at") is not None:
+        raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be edited or re-enabled."})
     allowed = {"name","hardware_model","gateway_id","slave_id","profile_id","polling_enabled"}
     if set(changes)-allowed:
         raise HTTPException(422,"Unsupported node fields")
@@ -1060,7 +1132,8 @@ async def patch_node(node_id: str, changes: dict, actor=Depends(authorize)):
     normalized["profile_id"] = fixed_profile
     normalized["hardware_model"] = fixed_model
     if normalized:
-        store.run(f"UPDATE nodes SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=?",(*normalized.values(),utc_now(),node_id))
+        updated=store.run(f"UPDATE nodes SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=? AND archived_at IS NULL",(*normalized.values(),utc_now(),node_id))
+        if updated.rowcount != 1: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be edited or re-enabled."})
         store.audit("UPDATE","node",node_id,changes,actor)
         if set(changes)&{"polling_enabled","gateway_id","slave_id"}:
             scheduler.cancel_node(node_id)
@@ -1081,8 +1154,7 @@ async def get_polling(node_id: str, _: str = Depends(authorize)):
 
 @app.put("/api/nodes/{node_id}/polling/groups/{category}")
 async def toggle_polling_group(node_id: str, category: str, enabled: bool = Query(...), actor=Depends(authorize)):
-    if not store.one("SELECT id FROM nodes WHERE id=?",(node_id,)):
-        raise HTTPException(404,"Node not found")
+    require_active_node(node_id)
     definitions={item["name"]:item["category"] for profile in PROFILES for item in profile["registers"]}
     selected=[name for name,group in definitions.items() if group==category]
     if not selected and category != "Custom Registers":
@@ -1111,9 +1183,7 @@ async def toggle_polling_group(node_id: str, category: str, enabled: bool = Quer
 
 @app.post("/api/nodes/{node_id}/polling", status_code=201)
 async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authorize)):
-    node=store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
-    if not node:
-        raise HTTPException(404,"Node not found")
+    node=require_active_node(node_id)
     if node["node_type"] != "ANALOG_INPUT":
         raise HTTPException(422,"Output-node polling requires a verified device profile")
     if data.profile_id:
@@ -1146,9 +1216,11 @@ async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authoriz
 
 @app.patch("/api/polling/{item_id}")
 async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
-    item=store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
+    item=store.one("SELECT p.*,n.archived_at FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
     if not item:
         raise HTTPException(404,"Polling item not found")
+    if item["archived_at"] is not None:
+        raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Polling configuration for archived nodes is read-only."})
     allowed={"enabled","interval_ms","timeout_ms","retries","scale","unit","byte_order","word_order"}
     if set(changes)-allowed:
         raise HTTPException(422,"Polling register identity cannot be changed in-place")
@@ -1182,33 +1254,43 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
 
 @app.delete("/api/polling/{item_id}", status_code=204)
 async def delete_polling(item_id: str, actor=Depends(authorize)):
-    item=store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
+    item=store.one("SELECT p.*,n.archived_at FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
     if not item: raise HTTPException(404,"Polling item not found")
+    if item["archived_at"] is not None:
+        raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Polling configuration for archived nodes is read-only."})
     scheduler.cancel_item(item_id)
     store.run("DELETE FROM polling_items WHERE id=?",(item_id,));store.audit("DELETE","polling_item",item_id,{},actor)
 
 
 @app.post("/api/polling/{item_id}/read")
 async def read_once(item_id: str, _: str = Depends(authorize)):
-    item=store.one("SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
+    item=store.one("SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled,n.archived_at FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
     if not item: raise HTTPException(404,"Polling item not found")
+    if item["archived_at"] is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be polled."})
     if not item["polling_enabled"]: raise HTTPException(409,"Node polling is disabled")
-    await scheduler.read_once(item)
+    try:
+        await scheduler.read_once(item)
+    except NodeOperationError as exc:
+        raise HTTPException(409,{"code":"NODE_UNAVAILABLE","message":str(exc)}) from exc
     return store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
 
 
 @app.post("/api/polling/{item_id}/verify-float")
 async def verify_float_order(item_id: str, data: FloatVerificationInput, actor=Depends(authorize)):
-    item=store.one("SELECT p.*,n.gateway_id,n.slave_id FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
+    item=store.one("SELECT p.*,n.gateway_id,n.slave_id,n.archived_at FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
     if not item: raise HTTPException(404,"Polling item not found")
+    if item["archived_at"] is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot perform Modbus reads."})
     if item["data_type"]!="float32_array" or item["quantity"]!=12 or item["function_code"]!=4:
         raise HTTPException(422,"Reference verification requires the six-channel ME31 Float32 input block")
     if item["enabled"]: raise HTTPException(409,"Disable float polling before changing verified decoding settings")
     session=sessions.for_gateway(item["gateway_id"])
     if session is None: raise HTTPException(409,"No commissioned gateway session is available")
     try:
-        registers,frame,request,latency=await session.read_registers(item["slave_id"],4,item["address"],12,item["timeout_ms"])
-        decoded=decode_registers(registers,"float32_array",byte_order=data.byte_order,word_order=data.word_order)
+        async with node_operations.operation(item["node_id"]):
+            registers,frame,request,latency=await session.read_registers(item["slave_id"],4,item["address"],12,item["timeout_ms"])
+            decoded=decode_registers(registers,"float32_array",byte_order=data.byte_order,word_order=data.word_order)
+    except NodeOperationError as exc:
+        raise HTTPException(409,{"code":"NODE_UNAVAILABLE","message":str(exc)}) from exc
     except Exception as exc:
         store.event("FLOAT_VERIFICATION_ERROR",str(exc),gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=4,address=item["address"],quantity=12)
         raise HTTPException(502,f"Float verification read failed: {exc}") from exc
@@ -1238,7 +1320,9 @@ async def calibration_preview(data: PreviewInput, _: str = Depends(authorize)):
 
 @app.get("/api/nodes/{node_id}/calibration")
 async def get_calibration(node_id: str, channel: int | None = None, _: str = Depends(authorize)):
-    if not store.one("SELECT id FROM nodes WHERE id=? AND node_type='ANALOG_INPUT'",(node_id,)): raise HTTPException(404,"Analog input node not found")
+    node=store.one("SELECT id,node_type,archived_at FROM nodes WHERE id=?",(node_id,))
+    if not node or node["node_type"]!="ANALOG_INPUT": raise HTTPException(404,"Analog input node not found")
+    if node["archived_at"] is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be calibrated."})
     query="SELECT * FROM calibrations WHERE node_id=?";params=[node_id]
     if channel is not None: query+=" AND channel=?";params.append(channel)
     return store.rows(query+" ORDER BY channel,revision DESC",params)
@@ -1248,6 +1332,7 @@ async def get_calibration(node_id: str, channel: int | None = None, _: str = Dep
 async def capture_calibration_sample(node_id: str, channel: int, data: CalibrationCaptureInput, _: str = Depends(authorize)):
     node=store.one("SELECT * FROM nodes WHERE id=? AND node_type='ANALOG_INPUT'",(node_id,))
     if not node: raise HTTPException(404,"Analog input node not found")
+    if node.get("archived_at") is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be used for calibration capture."})
     if channel not in range(1,7): raise HTTPException(422,"Channel must be AI1–AI6")
     latest=store.one("SELECT * FROM measurements WHERE node_id=? AND channel=? ORDER BY id DESC LIMIT 1",(node_id,channel))
     items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node_id,))
@@ -1277,23 +1362,31 @@ async def capture_calibration_sample(node_id: str, channel: int, data: Calibrati
 
 @app.put("/api/nodes/{node_id}/calibration")
 async def save_calibration(node_id: str, data: CalibrationInput, actor=Depends(authorize)):
-    if not store.one("SELECT id FROM nodes WHERE id=? AND node_type='ANALOG_INPUT'",(node_id,)): raise HTTPException(404,"Analog input node not found")
+    node=store.one("SELECT id,node_type,archived_at FROM nodes WHERE id=?",(node_id,))
+    if not node or node["node_type"]!="ANALOG_INPUT": raise HTTPException(404,"Analog input node not found")
+    if node["archived_at"] is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be calibrated."})
     if data.scaling:
         from .calibration import Scaling, scale
         try: scale(0,Scaling(**data.scaling))
         except (TypeError,ValueError) as exc: raise HTTPException(422,str(exc))
-    with store.transaction() as db:
-        current=db.execute("SELECT MAX(revision) value FROM calibrations WHERE node_id=? AND channel=?",(node_id,data.channel)).fetchone()["value"] or 0
-        revision=current+1
-        now=utc_now()
-        db.execute("INSERT INTO calibrations(node_id,channel,revision,gain,offset_ma,enabled,scaling_json,method,modified_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(node_id,data.channel,revision,data.gain,data.offset_ma,int(data.enabled),json.dumps(data.scaling) if data.scaling else None,data.method,actor,now))
-        db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",(now,actor,"CALIBRATION_CHANGED","channel",f"{node_id}:{data.channel}",json.dumps(data.model_dump(),sort_keys=True)))
+    try:
+        async with node_operations.operation(node_id):
+            with store.transaction() as db:
+                current=db.execute("SELECT MAX(revision) value FROM calibrations WHERE node_id=? AND channel=?",(node_id,data.channel)).fetchone()["value"] or 0
+                revision=current+1
+                now=utc_now()
+                db.execute("INSERT INTO calibrations(node_id,channel,revision,gain,offset_ma,enabled,scaling_json,method,modified_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(node_id,data.channel,revision,data.gain,data.offset_ma,int(data.enabled),json.dumps(data.scaling) if data.scaling else None,data.method,actor,now))
+                db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",(now,actor,"CALIBRATION_CHANGED","channel",f"{node_id}:{data.channel}",json.dumps(data.model_dump(),sort_keys=True)))
+    except NodeOperationError as exc:
+        raise HTTPException(409,{"code":"NODE_ARCHIVED","message":str(exc)}) from exc
     return store.one("SELECT * FROM calibrations WHERE node_id=? AND channel=? AND revision=?",(node_id,data.channel,revision))
 
 
 @app.post("/api/nodes/{node_id}/calibration/two-point")
 async def save_two_point(node_id: str, data: dict, actor=Depends(authorize)):
-    if not store.one("SELECT id FROM nodes WHERE id=? AND node_type='ANALOG_INPUT'",(node_id,)): raise HTTPException(404,"Analog input node not found")
+    node=store.one("SELECT id,node_type,archived_at FROM nodes WHERE id=?",(node_id,))
+    if not node or node["node_type"]!="ANALOG_INPUT": raise HTTPException(404,"Analog input node not found")
+    if node["archived_at"] is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be calibrated."})
     try:
         from .calibration import two_point
         channel=int(data["channel"]); computed=two_point(float(data["raw1"]),float(data["reference1"]),float(data["raw2"]),float(data["reference2"]))
@@ -1340,11 +1433,13 @@ async def logs(limit: int = Query(default=100,ge=1,le=1000), offset: int = Query
 async def output_state(node_id: str, _: str = Depends(authorize)):
     node=store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
     if not node: raise HTTPException(404,"Output node not found")
+    if node.get("archived_at") is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived output nodes are read-only; no live device read is started."})
     if node["node_type"]!="ANALOG_OUTPUT": raise HTTPException(422,"Node is not an analog output")
     try:
         state=await output_driver.inspect(node_id)
     except OutputError as exc:
-        raise HTTPException(422,str(exc)) from exc
+        code=409 if "archived" in str(exc).lower() or "being archived" in str(exc).lower() else 422
+        raise HTTPException(code,str(exc)) from exc
     except Exception as exc:
         raise HTTPException(503,f"Output read failed: {exc}") from exc
     for channel in state["channels"]:
@@ -1356,12 +1451,14 @@ async def output_state(node_id: str, _: str = Depends(authorize)):
 
 @app.post("/api/nodes/{node_id}/outputs/{channel}/set")
 async def manual_output_set(node_id: str, channel: int, data: OutputSetpointInput, actor=Depends(authorize)):
+    node=require_active_node(node_id)
+    if node["node_type"] != "ANALOG_OUTPUT": raise HTTPException(422,"Node is not an analog output")
     if not data.confirm:
         raise HTTPException(422,"Confirm the physical output test before sending an AO command")
     try:
         result=await output_driver.set_output(node_id,channel,data.target_ma,source=f"MANUAL:{actor}")
     except OutputError as exc:
-        code=409 if "locked" in str(exc).lower() or "active pipeline" in str(exc).lower() else 422
+        code=409 if any(term in str(exc).lower() for term in ("locked","active pipeline","archived","being archived")) else 422
         raise HTTPException(code,str(exc)) from exc
     except (ConnectionError,TimeoutError) as exc:
         raise HTTPException(503,str(exc)) from exc
@@ -1500,8 +1597,8 @@ async def telemetry_socket(websocket: WebSocket):
         last_signature=None
         last_heartbeat=0.0
         while True:
-            latest=store.rows("SELECT m.* FROM measurements m JOIN (SELECT node_id,channel,MAX(id) id FROM measurements GROUP BY node_id,channel) v ON v.id=m.id ORDER BY m.node_id,m.channel")
-            nodes={row["id"]:row for row in store.rows("SELECT * FROM nodes WHERE node_type='ANALOG_INPUT'")}
+            latest=store.rows("SELECT m.* FROM measurements m JOIN (SELECT node_id,channel,MAX(id) id FROM measurements GROUP BY node_id,channel) v ON v.id=m.id JOIN nodes n ON n.id=m.node_id WHERE n.archived_at IS NULL ORDER BY m.node_id,m.channel")
+            nodes={row["id"]:row for row in store.rows("SELECT * FROM nodes WHERE node_type='ANALOG_INPUT' AND archived_at IS NULL")}
             for measurement in latest:
                 node=nodes.get(measurement["node_id"])
                 if node:
