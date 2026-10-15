@@ -1,7 +1,8 @@
 """Small Modbus read codec for MBAP, RTU ADU, and transparent serial-over-TCP."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import struct
+import math
 
 
 class ModbusError(Exception):
@@ -89,7 +90,9 @@ def decode_response(mode: str, frame: bytes, *, unit_id: int, function_code: int
         function = frame[1]
         body = frame[2:-2]
     if function == (function_code | 0x80):
-        code = body[0] if body else 0
+        if len(body) != 1:
+            raise ModbusError("invalid Modbus exception response length")
+        code = body[0]
         raise ModbusExceptionResponse(function_code, code)
     if function != function_code:
         raise ModbusError(f"function code mismatch: expected {function_code}, received {function}")
@@ -100,6 +103,8 @@ def decode_response(mode: str, frame: bytes, *, unit_id: int, function_code: int
 
 
 def decode_registers(registers: list[int], data_type: str, *, byte_order="big", word_order="BIG_WORD_FIRST"):
+    if byte_order not in {"big", "little"}:
+        raise ModbusError(f"unsupported byte order {byte_order}")
     if data_type in {"uint16", "uint16_array", "enum16_array", "raw"}:
         return registers[0] if data_type == "uint16" else registers
     if data_type == "int16":
@@ -118,6 +123,8 @@ def decode_registers(registers: list[int], data_type: str, *, byte_order="big", 
             if byte_order == "little":
                 raw = bytes((raw[1], raw[0], raw[3], raw[2]))
             value = struct.unpack(">f", raw)[0]
+            if not math.isfinite(value):
+                raise ModbusError("float32 register value is not finite")
             floats.append(value)
         return floats[0] if data_type == "float32" else floats
     if data_type == "ascii":
@@ -129,13 +136,21 @@ def decode_registers(registers: list[int], data_type: str, *, byte_order="big", 
 class StreamFrames:
     mode: str
     buffer: bytearray
+    errors: list[str] = field(default_factory=list)
 
     @classmethod
     def create(cls, mode: str):
         return cls(mode, bytearray())
 
     def push(self, data: bytes) -> list[bytes]:
+        self.errors.clear()
+        if self.mode not in {"MODBUS_TCP", "MODBUS_RTU", "TRANSPARENT_SERIAL"}:
+            raise ModbusError("unsupported stream framing mode")
         self.buffer.extend(data)
+        if len(self.buffer) > 8192:
+            keep = 5 if self.mode == "MODBUS_TCP" else 2
+            self.buffer[:] = self.buffer[-keep:]
+            self.errors.append("stream buffer exceeded 8192 bytes; discarded unsynchronized data")
         frames = []
         while self.buffer:
             if self.mode == "MODBUS_TCP":
@@ -143,22 +158,71 @@ class StreamFrames:
                     break
                 length = int.from_bytes(self.buffer[4:6], "big")
                 if not 2 <= length <= 254 or int.from_bytes(self.buffer[2:4], "big") != 0:
-                    raise ModbusError("invalid MBAP header in TCP stream")
+                    next_header = next((offset for offset in range(1, max(1, len(self.buffer) - 5))
+                                        if int.from_bytes(self.buffer[offset + 2:offset + 4], "big") == 0
+                                        and 2 <= int.from_bytes(self.buffer[offset + 4:offset + 6], "big") <= 254), None)
+                    if next_header is None:
+                        discarded = max(0, len(self.buffer) - 5)
+                        if discarded:
+                            del self.buffer[:discarded]
+                            self.errors.append(f"invalid MBAP stream data; discarded {discarded} byte(s)")
+                        break
+                    del self.buffer[:next_header]
+                    self.errors.append(f"invalid MBAP header; resynchronized after {next_header} byte(s)")
+                    continue
                 total = 6 + length
             else:
                 if len(self.buffer) < 2:
                     break
+                if self.buffer[0] not in range(1, 248):
+                    del self.buffer[0]
+                    self.errors.append("discarded RTU byte outside slave address range")
+                    continue
                 function = self.buffer[1]
-                if function & 0x80:
+                if function in (0x83, 0x84):
                     total = 5
                 elif function in (3, 4):
                     if len(self.buffer) < 3:
                         break
-                    total = 5 + self.buffer[2]
+                    byte_count = self.buffer[2]
+                    if byte_count == 0 or byte_count > 250 or byte_count % 2:
+                        del self.buffer[0]
+                        self.errors.append("invalid RTU register byte count; resynchronizing")
+                        continue
+                    total = 5 + byte_count
                 else:
-                    raise ModbusError(f"unexpected RTU function code {function}")
+                    del self.buffer[0]
+                    self.errors.append(f"unexpected RTU function code {function}; resynchronizing")
+                    continue
             if len(self.buffer) < total:
                 break
-            frames.append(bytes(self.buffer[:total]))
+            candidate = bytes(self.buffer[:total])
+            if self.mode != "MODBUS_TCP" and crc16(candidate[:-2]) != int.from_bytes(candidate[-2:], "little"):
+                recovered = None
+                for offset in range(1, len(self.buffer) - 4):
+                    if self.buffer[offset] not in range(1, 248):
+                        continue
+                    function = self.buffer[offset + 1]
+                    if function in (0x83, 0x84):
+                        candidate_length = 5
+                    elif function in (3, 4) and offset + 3 <= len(self.buffer):
+                        byte_count = self.buffer[offset + 2]
+                        if byte_count == 0 or byte_count > 250 or byte_count % 2:
+                            continue
+                        candidate_length = 5 + byte_count
+                    else:
+                        continue
+                    end = offset + candidate_length
+                    if end <= len(self.buffer) and crc16(self.buffer[offset:end - 2]) == int.from_bytes(self.buffer[end - 2:end], "little"):
+                        recovered = offset
+                        break
+                if recovered is None:
+                    del self.buffer[0]
+                    self.errors.append("RTU CRC mismatch; resynchronizing")
+                else:
+                    del self.buffer[:recovered]
+                    self.errors.append(f"RTU CRC mismatch; recovered after {recovered} byte(s)")
+                continue
+            frames.append(candidate)
             del self.buffer[:total]
         return frames

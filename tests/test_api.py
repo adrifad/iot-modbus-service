@@ -1,12 +1,16 @@
 import os
+import asyncio
+import hashlib
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from backend import app as service
+from backend.gateway import GatewaySession
 from backend.store import Store
 
 
@@ -14,6 +18,8 @@ class ApiTests(unittest.TestCase):
     def test_management_auth_and_persistent_polling_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
             database = Store(os.path.join(temp, "service.db"))
+            if service.store is not database:
+                service.store.close()
             service.store = database
             service.scheduler.store = database
             service.sessions.store = database
@@ -28,6 +34,48 @@ class ApiTests(unittest.TestCase):
                         "id": gateway_id, "name": "Bench gateway", "model": "USR-G781", "transport_mode": "MODBUS_TCP"
                     })
                     self.assertEqual(created_gateway.status_code, 201)
+                    transparent_id = str(uuid4())
+                    transparent = client.post("/api/gateways", headers=headers, json={
+                        "id": transparent_id, "name": "Transparent gateway", "model": "USR-G781", "transport_mode": "TRANSPARENT_SERIAL"
+                    })
+                    self.assertEqual(transparent.status_code, 201)
+                    registration = client.post(f"/api/gateways/{transparent_id}/registration-token", headers=headers, json={})
+                    self.assertEqual(registration.status_code, 200, registration.text)
+                    packet = registration.json()["registration_packet"]
+                    token_value = packet.split(" ")[2].strip()
+                    self.assertEqual(database.one("SELECT registration_token_hash FROM gateways WHERE id=?", (transparent_id,))["registration_token_hash"], hashlib.sha256(token_value.encode()).hexdigest())
+                    self.assertNotIn(token_value, str(database.one("SELECT * FROM gateways WHERE id=?", (transparent_id,))))
+
+                    class IdentityWriter:
+                        def get_extra_info(self, _name): return None
+                        def close(self): pass
+                        async def wait_closed(self): pass
+
+                    async def identify_after_nat_reconnect():
+                        first = GatewaySession("identity-first", asyncio.StreamReader(), IdentityWriter(), "192.0.2.10:4000", peer_ip="192.0.2.10")
+                        first.state = "UNCOMMISSIONED"
+                        service.sessions.sessions[first.session_id] = first
+                        accepted = await service.authenticate_gateway_identity(first, packet.strip().encode("ascii"))
+                        self.assertTrue(accepted)
+                        second = GatewaySession("identity-reconnect", asyncio.StreamReader(), IdentityWriter(), "192.0.2.99:50000", peer_ip="192.0.2.99")
+                        second.state = "UNCOMMISSIONED"
+                        service.sessions.sessions[second.session_id] = second
+                        accepted = await service.authenticate_gateway_identity(second, packet.strip().encode("ascii"))
+                        self.assertTrue(accepted)
+                        self.assertEqual(service.sessions.for_gateway(transparent_id), second)
+                        self.assertEqual(first.state, "RETIRED")
+                        outsider = GatewaySession("identity-outsider", asyncio.StreamReader(), IdentityWriter(), "203.0.113.77:60000", peer_ip="203.0.113.77")
+                        outsider.state = "UNCOMMISSIONED"
+                        self.assertFalse(await service.authenticate_gateway_identity(outsider, packet.strip().encode("ascii")))
+                        self.assertIsNone(outsider.gateway_id)
+                        invalid_identity = GatewaySession("identity-invalid-token", asyncio.StreamReader(), IdentityWriter(), "192.0.2.20:51000", peer_ip="192.0.2.20")
+                        invalid_identity.state = "UNCOMMISSIONED"
+                        wrong_packet = packet.replace(token_value, "invalid-token")
+                        self.assertFalse(await service.authenticate_gateway_identity(invalid_identity, wrong_packet.strip().encode("ascii")))
+                        self.assertIsNone(invalid_identity.gateway_id)
+                    with patch.dict(os.environ, {"GATEWAY_TRUSTED_CIDRS": "192.0.2.0/24"}):
+                        asyncio.run(identify_after_nat_reconnect())
+                    self.assertEqual(database.one("SELECT reconnection_count FROM gateways WHERE id=?", (transparent_id,))["reconnection_count"], 1)
                     created_node = client.post("/api/nodes", headers=headers, json={
                         "id": node_id, "name": "Bench input", "node_type": "ANALOG_INPUT", "hardware_model": "EBYTE ME31-XAXX0600",
                         "gateway_id": gateway_id, "slave_id": 1, "profile_id": "ebyte-me31-xaxx0600-v1.1"
@@ -58,7 +106,71 @@ class ApiTests(unittest.TestCase):
                     })
                     self.assertEqual(network.status_code, 201, network.text)
                     self.assertEqual(network.json()["enabled"], 0)
-                    self.assertEqual(client.get("/api/overview", headers=headers).json()["inputs"]["total"], 1)
+
+                    float_item = client.post(f"/api/nodes/{node_id}/polling", headers=headers, json={
+                        "profile_id": "ebyte-me31-xaxx0600-v1.1", "register_name": "AI float block",
+                        "function_code": 4, "address": 0x00C8, "quantity": 12, "data_type": "float32_array",
+                        "word_order": "unverified", "interval_ms": 1000, "timeout_ms": 1500, "retries": 1,
+                        "scale": 1, "unit": "mA", "enabled": False
+                    })
+                    self.assertEqual(float_item.status_code, 201, float_item.text)
+                    self.assertEqual(float_item.json()["float_verified"], 0)
+                    self.assertEqual(client.patch(f"/api/polling/{float_item.json()['id']}", headers=headers, json={"enabled": True}).status_code, 422)
+                    group_enable = client.put(f"/api/nodes/{node_id}/polling/groups/Analog%20Measurements?enabled=true", headers=headers, json={})
+                    self.assertEqual(group_enable.status_code, 409)
+
+                    class FloatSession:
+                        transport_mode = "MODBUS_TCP"
+                        async def read_registers(self, *_args):
+                            return [0x4148, 0x0000] * 6, bytes.fromhex("00 01 00 00 00 1B 01 04 18") + bytes.fromhex("41 48 00 00") * 6, bytes.fromhex("00 01 00 00 00 06 01 04 00 C8 00 0C"), 2.5
+                    with patch.object(service.sessions, "for_gateway", return_value=FloatSession()):
+                        verified = client.post(f"/api/polling/{float_item.json()['id']}/verify-float", headers=headers, json={
+                            "channel": 1, "reference_ma": 12.5, "tolerance_ma": 0.01,
+                            "byte_order": "big", "word_order": "BIG_WORD_FIRST"
+                        })
+                    self.assertEqual(verified.status_code, 200, verified.text)
+                    self.assertTrue(verified.json()["verified"])
+                    self.assertEqual(client.patch(f"/api/polling/{float_item.json()['id']}", headers=headers, json={"enabled": True}).json()["enabled"], 1)
+
+                    ai2 = client.post(f"/api/nodes/{node_id}/polling", headers=headers, json={
+                        "profile_id": "ebyte-me31-xaxx0600-v1.1", "register_name": "AI2 current",
+                        "function_code": 4, "address": 0x0065, "quantity": 1, "data_type": "uint16",
+                        "interval_ms": 1000, "timeout_ms": 1500, "retries": 1, "scale": 0.001, "unit": "mA"
+                    })
+                    self.assertEqual(ai2.status_code, 201, ai2.text)
+                    sample_at = datetime.now(timezone.utc).isoformat()
+                    database.run("UPDATE polling_items SET last_status='GOOD',last_success_at=? WHERE id=?", (sample_at, ai2.json()["id"]))
+                    for raw in (12.001, 12.000, 12.002):
+                        database.run("INSERT INTO measurements(node_id,channel,register_value,raw_registers_json,raw_ma,calibrated_ma,quality,measured_at) VALUES(?,?,?,?,?,?,?,?)",
+                                     (node_id, 2, 12000, "[12000]", raw, raw, "GOOD", sample_at))
+                    capture = client.post(f"/api/nodes/{node_id}/calibration/2/capture", headers=headers, json={"tolerance_ma": 0.01})
+                    self.assertEqual(capture.status_code, 200, capture.text)
+                    self.assertAlmostEqual(capture.json()["raw_ma"], 12.001)
+                    self.assertEqual(capture.json()["samples"], 3)
+                    unstable = client.post(f"/api/nodes/{node_id}/calibration/2/capture", headers=headers, json={"tolerance_ma": 0.0005})
+                    self.assertEqual(unstable.status_code, 409)
+                    revision_one = client.put(f"/api/nodes/{node_id}/calibration", headers=headers, json={"channel": 2, "gain": 1.02, "offset_ma": -0.1, "enabled": True, "method": "GAIN_OFFSET"})
+                    self.assertEqual(revision_one.status_code, 200, revision_one.text)
+                    revision_two = client.post(f"/api/nodes/{node_id}/calibration/2/revert/{revision_one.json()['revision']}", headers=headers, json={})
+                    self.assertEqual(revision_two.status_code, 200, revision_two.text)
+                    self.assertEqual(revision_two.json()["revision"], revision_one.json()["revision"] + 1)
+                    self.assertAlmostEqual(revision_two.json()["gain"], 1.02)
+                    self.assertAlmostEqual(database.one("SELECT raw_ma FROM measurements WHERE node_id=? AND channel=2 ORDER BY id DESC LIMIT 1", (node_id,))["raw_ma"], 12.002)
+                    stale_at = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+                    database.run("UPDATE polling_items SET last_success_at=? WHERE id=?", (stale_at, ai2.json()["id"]))
+                    database.run("UPDATE measurements SET measured_at=? WHERE node_id=? AND channel=2", (stale_at, node_id))
+                    stale = client.post(f"/api/nodes/{node_id}/calibration/2/capture", headers=headers, json={"tolerance_ma": 0.01})
+                    self.assertEqual(stale.status_code, 409)
+                    overview = client.get("/api/overview", headers=headers).json()
+                    self.assertEqual(overview["inputs"]["total"], 1)
+                    self.assertEqual(overview["inputs"]["gateway_connected"], 0)
+                    self.assertEqual(overview["inputs"]["disconnected"], 1)
+                    self.assertEqual(overview["inputs"]["unassigned"], 0)
+                    self.assertEqual(overview["inputs"]["modbus_responding"], 0)
+                    self.assertEqual(overview["outputs"]["total"], 0)
+                    with client.websocket_connect("/ws/telemetry") as websocket:
+                        websocket.send_json({"type": "auth", "token": token})
+                        self.assertEqual(websocket.receive_json()["type"], "authenticated")
 
 
 if __name__ == "__main__":
