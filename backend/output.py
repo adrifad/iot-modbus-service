@@ -4,6 +4,7 @@ import asyncio
 import math
 
 from .gateway import OutputReadbackError
+from .node_lifecycle import NodeOperationError, NodeOperationGate
 from .store import utc_now
 
 
@@ -22,9 +23,10 @@ class OutputOutcomeUnknown(ConnectionError):
 class OutputDriver:
     READBACK_TOLERANCE_MA = 0.05
 
-    def __init__(self, store, sessions):
+    def __init__(self, store, sessions, operations: NodeOperationGate | None = None):
         self.store = store
         self.sessions = sessions
+        self.operations = operations or NodeOperationGate(store)
         self._locks: dict[tuple[str, int], asyncio.Lock] = {}
 
     def lock_for(self, node_id: str, channel: int) -> asyncio.Lock:
@@ -44,6 +46,8 @@ class OutputDriver:
         node = self.store.one("SELECT n.*,g.transport_mode FROM nodes n LEFT JOIN gateways g ON g.id=n.gateway_id WHERE n.id=?", (node_id,))
         if not node:
             raise OutputError("Output node not found")
+        if node.get("archived_at") is not None:
+            raise OutputError("Output node is archived and cannot perform Modbus operations")
         if node["node_type"] != "ANALOG_OUTPUT" or node["profile_id"] != "ebyte-me31-xxxa0006-v1.1":
             raise OutputError("Output command requires a registered EBYTE ME31-XXXA0006 node")
         if node["hardware_model"] != "EBYTE ME31-XXXA0006":
@@ -63,6 +67,13 @@ class OutputDriver:
         return session
 
     async def inspect(self, node_id: str, *, range_timeout_ms: int | None = None, readback_timeout_ms: int | None = None):
+        try:
+            async with self.operations.operation(node_id):
+                return await self._inspect(node_id, range_timeout_ms=range_timeout_ms, readback_timeout_ms=readback_timeout_ms)
+        except NodeOperationError as exc:
+            raise OutputError(str(exc)) from exc
+
+    async def _inspect(self, node_id: str, *, range_timeout_ms: int | None = None, readback_timeout_ms: int | None = None):
         node = self._node(node_id)
         session = self._session(node)
         range_timeout = self.timeout_ms("output_range_timeout_ms", range_timeout_ms)
@@ -104,6 +115,17 @@ class OutputDriver:
         }
 
     async def set_output(self, node_id: str, channel: int, target_ma: float, *, source: str,
+                         range_timeout_ms: int | None = None, write_timeout_ms: int | None = None,
+                         readback_timeout_ms: int | None = None, pipeline_id: str | None = None):
+        try:
+            async with self.operations.operation(node_id):
+                return await self._set_output(node_id, channel, target_ma, source=source,
+                    range_timeout_ms=range_timeout_ms, write_timeout_ms=write_timeout_ms,
+                    readback_timeout_ms=readback_timeout_ms, pipeline_id=pipeline_id)
+        except NodeOperationError as exc:
+            raise OutputError(str(exc)) from exc
+
+    async def _set_output(self, node_id: str, channel: int, target_ma: float, *, source: str,
                          range_timeout_ms: int | None = None, write_timeout_ms: int | None = None,
                          readback_timeout_ms: int | None = None, pipeline_id: str | None = None):
         if channel not in range(1, 7):

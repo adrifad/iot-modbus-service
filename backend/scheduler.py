@@ -9,13 +9,15 @@ from datetime import datetime, timedelta, timezone
 
 from .calibration import Calibration, Scaling, calibrate, scale
 from .modbus import ModbusError, ModbusExceptionResponse, decode_registers
+from .node_lifecycle import NodeOperationError, NodeOperationGate
 from .store import utc_now
 
 
 class PollScheduler:
-    def __init__(self, store, sessions):
+    def __init__(self, store, sessions, operations: NodeOperationGate | None = None):
         self.store = store
         self.sessions = sessions
+        self.operations = operations or NodeOperationGate(store)
         self.task = None
         self.due: dict[str, float] = {}
         self.intervals: dict[str, int] = {}
@@ -26,6 +28,7 @@ class PollScheduler:
         self.failed = 0
         self.latencies: list[float] = []
         self.last_cleanup = 0.0
+        self.paused_nodes: set[str] = set()
 
     def start(self):
         if self.task is None or self.task.done():
@@ -64,6 +67,16 @@ class PollScheduler:
             self.due.pop(item_id, None)
             self.intervals.pop(item_id, None)
 
+    def pause_node(self, node_id: str):
+        """Stop scheduling new work without cancelling an active RTU request."""
+        self.paused_nodes.add(node_id)
+        for row in self.store.rows("SELECT id FROM polling_items WHERE node_id=?", (node_id,)):
+            self.due.pop(row["id"], None)
+            self.intervals.pop(row["id"], None)
+
+    def resume_node(self, node_id: str):
+        self.paused_nodes.discard(node_id)
+
     async def loop(self):
         while self.running:
             now_mono = time.monotonic()
@@ -74,7 +87,7 @@ class PollScheduler:
             items = self.store.rows("""
                 SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled
                 FROM polling_items p JOIN nodes n ON n.id=p.node_id
-                WHERE p.enabled=1 AND n.polling_enabled=1
+                WHERE p.enabled=1 AND n.polling_enabled=1 AND n.archived_at IS NULL
                 ORDER BY p.node_id,p.address,p.id
             """)
             current = {item["id"] for item in items}
@@ -91,6 +104,8 @@ class PollScheduler:
             due_items = []
             for item in items:
                 item_id = item["id"]
+                if item["node_id"] in self.paused_nodes:
+                    continue
                 task = self.tasks.get(item_id)
                 interval = item["interval_ms"]
                 if self.intervals.get(item_id) != interval:
@@ -114,8 +129,8 @@ class PollScheduler:
         event_cutoff = (now - timedelta(days=max(1, int(os.getenv("EVENT_RETENTION_DAYS", "90"))))).isoformat()
         measurement_cutoff = (now - timedelta(days=max(1, int(os.getenv("MEASUREMENT_RETENTION_DAYS", "365"))))).isoformat()
         with self.store.transaction() as db:
-            db.execute("DELETE FROM events WHERE at < ?", (event_cutoff,))
-            db.execute("DELETE FROM measurements WHERE measured_at < ?", (measurement_cutoff,))
+            db.execute("DELETE FROM events WHERE at < ? AND (node_id IS NULL OR node_id IN (SELECT id FROM nodes WHERE archived_at IS NULL))", (event_cutoff,))
+            db.execute("DELETE FROM measurements WHERE measured_at < ? AND node_id IN (SELECT id FROM nodes WHERE archived_at IS NULL)", (measurement_cutoff,))
 
     @staticmethod
     def _can_batch(item):
@@ -155,6 +170,20 @@ class PollScheduler:
         return groups
 
     async def _poll_group(self, items):
+        current = asyncio.current_task()
+        node_id = items[0]["node_id"]
+        try:
+            async with self.operations.operation(node_id):
+                await self._poll_group_active(items)
+        except NodeOperationError:
+            # An archive barrier has begun. The request was never sent.
+            return False
+        finally:
+            for item in items:
+                if self.tasks.get(item["id"]) is current:
+                    self.tasks.pop(item["id"], None)
+
+    async def _poll_group_active(self, items):
         first = items[0]
         session = None
         try:
@@ -294,4 +323,7 @@ class PollScheduler:
             return
         task = asyncio.current_task()
         self.tasks[item["id"]] = task
-        return await self.poll(item)
+        result = await self.poll(item)
+        if result is False:
+            raise NodeOperationError("Node archival is in progress; no Modbus request was sent")
+        return result
