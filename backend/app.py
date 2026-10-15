@@ -10,6 +10,8 @@ import os
 import secrets
 import socket
 import ssl
+import fcntl
+import struct
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .gateway import GatewaySession
+from .healthcheck import GatewayHealthMonitor
 from .modbus import decode_registers
 from .output import OutputDriver, OutputError
 from .pipelines import PipelineError, PipelineService
@@ -45,22 +48,33 @@ class SessionRegistry:
 
     async def assign(self, session, gateway, *, identity_verified=False, commissioning_method="OPERATOR_ASSIGNMENT"):
         replaced = False
+        previous = None
         async with self.lock:
+            persisted = self.store.one("SELECT * FROM gateways WHERE id=?", (gateway["id"],))
+            if not persisted:
+                raise KeyError("Gateway registration was removed before the session could be commissioned")
             previous = self.for_gateway(gateway["id"])
             if previous is session:
                 return
             if previous:
                 previous.state = "RETIRED"
-                self.by_gateway.pop(gateway["id"], None)
-                await previous.retire()
-                self.store.event("SESSION_REPLACED", "Gateway session explicitly replaced during commissioning", gateway_id=gateway["id"],protocol=previous.transport_mode)
                 replaced = True
             await session.commission(gateway["id"], gateway["transport_mode"], identity_verified=identity_verified, commissioning_method=commissioning_method)
+            session.generation = int(persisted.get("session_generation") or 0) + 1
             self.by_gateway[gateway["id"]] = session.session_id
-            old_connected = gateway.get("last_connected_at") is not None
+            old_connected = persisted.get("last_connected_at") is not None
             now = utc_now()
-            self.store.run("UPDATE gateways SET last_connected_at=?,last_activity_at=?,reconnection_count=reconnection_count+?,updated_at=? WHERE id=?", (now,now,int(old_connected),now,gateway["id"]))
-            self.store.event("RECONNECTED" if old_connected else "CONNECTED", f"Gateway session commissioned from {session.peer}", gateway_id=gateway["id"],protocol=session.transport_mode)
+            self.store.run("UPDATE gateways SET last_connected_at=?,last_activity_at=?,last_session_id=?,session_generation=?,identity_verified=?,connection_state='MODBUS_VERIFYING',commissioning_state='COMMISSIONED',reconnection_count=reconnection_count+?,last_reconnected_at=CASE WHEN ?>0 THEN ? ELSE last_reconnected_at END,updated_at=? WHERE id=?", (now,now,session.session_id,session.generation,int(identity_verified),int(old_connected),int(old_connected),now,now,gateway["id"]))
+            event = "GATEWAY_SESSION_REPLACED" if replaced else "GATEWAY_AUTO_COMMISSIONED" if commissioning_method == "WIREGUARD_INGRESS" else "GATEWAY_RECONNECTED" if old_connected else "GATEWAY_TCP_CONNECTED"
+            self.store.event(event, f"Commissioned session {session.session_id} generation {session.generation} from {session.peer} using {commissioning_method}", gateway_id=gateway["id"],protocol=session.transport_mode,session_id=session.session_id,session_generation=session.generation,identity_method=commissioning_method,peer=session.peer)
+            if old_connected and event != "GATEWAY_RECONNECTED":
+                self.store.event("GATEWAY_RECONNECTED", "Previously registered gateway established a new trusted or operator-commissioned session", gateway_id=gateway["id"],protocol=session.transport_mode,session_id=session.session_id,session_generation=session.generation,identity_method=commissioning_method,peer=session.peer)
+            if replaced:
+                self.store.event("SESSION_REPLACED", "Gateway session replaced by a newer commissioned connection", gateway_id=gateway["id"], protocol=session.transport_mode)
+        # Close the old stream after ownership has moved. Its reader callback
+        # is fenced by session ID and cannot change the new session's state.
+        if previous:
+            await previous.retire()
         if replaced and self.store is store:
             await pipelines.gateway_disconnected(gateway["id"], "previous session replaced", operator_initiated=False)
 
@@ -86,7 +100,9 @@ sessions = SessionRegistry(store)
 scheduler = PollScheduler(store, sessions)
 output_driver = OutputDriver(store, sessions)
 pipelines = PipelineService(store, sessions, output_driver)
+health_monitor = GatewayHealthMonitor(store, sessions, output_driver)
 tcp_server = None
+ingress_servers: dict[str, asyncio.AbstractServer] = {}
 
 
 async def on_disconnect(session, error=None):
@@ -94,14 +110,15 @@ async def on_disconnect(session, error=None):
         if sessions.by_gateway.get(session.gateway_id) == session.session_id:
             sessions.by_gateway.pop(session.gateway_id, None)
             reason = str(error or "Gateway TCP session closed")
-            store.run("UPDATE gateways SET last_disconnected_at=?,last_disconnect_reason=?,connection_errors=connection_errors+? WHERE id=?", (utc_now(),reason,int(error is not None),session.gateway_id))
-            store.event("SESSION_DESYNCHRONIZED" if session.desynchronized else "DISCONNECTED", reason, gateway_id=session.gateway_id, protocol=session.transport_mode)
-            # Free the closed socket slot before any bounded fail-safe network
-            # operation; this callback runs without the registry lock.
-            sessions.sessions.pop(session.session_id, None)
-            sessions.tasks.pop(session.session_id, None)
+            gateway = store.one("SELECT auto_reconnect_enabled FROM gateways WHERE id=?", (session.gateway_id,))
+            state = "WAITING_FOR_RECONNECT" if gateway and gateway["auto_reconnect_enabled"] else "DISCONNECTED"
+            store.run("UPDATE gateways SET last_disconnected_at=?,last_disconnect_reason=?,connection_errors=connection_errors+?,connection_state=?,commissioning_state=CASE WHEN auto_reconnect_enabled=1 THEN 'WAITING_FOR_RECONNECT' ELSE 'MANUAL_REQUIRED' END,identity_verified=0,updated_at=? WHERE id=? AND last_session_id=?", (utc_now(),reason,int(error is not None),state,utc_now(),session.gateway_id,session.session_id))
+            store.event("GATEWAY_WAITING_FOR_RECONNECT" if state == "WAITING_FOR_RECONNECT" else "GATEWAY_DISCONNECTED", reason, gateway_id=session.gateway_id, protocol=session.transport_mode,session_id=session.session_id,session_generation=getattr(session,"generation",None),identity_method=getattr(session,"commissioning_method",None),peer=getattr(session,"peer",None))
             if not sessions.shutting_down:
                 await pipelines.gateway_disconnected(session.gateway_id, reason, operator_initiated=False)
+        # Stale/replaced sessions may clean up only their own registry entry.
+        sessions.sessions.pop(session.session_id, None)
+        sessions.tasks.pop(session.session_id, None)
     elif session.state != "RETIRED":
         store.event("PENDING_DISCONNECTED", "Uncommissioned TCP session closed", protocol="TCP")
 
@@ -113,6 +130,14 @@ async def on_invalid_gateway_frame(session, detail):
 async def on_unsolicited_gateway_frame(session, frame, detail):
     store.event("UNSOLICITED_FRAME", detail, gateway_id=session.gateway_id, protocol=session.transport_mode,
                 direction="RX", response_hex=frame.hex(" "))
+
+
+async def on_gateway_modbus_success(session, latency_ms):
+    now = utc_now()
+    previous = store.one("SELECT connection_state FROM gateways WHERE id=?", (session.gateway_id,))
+    updated = store.run("UPDATE gateways SET last_successful_modbus_at=?,last_modbus_generation=?,last_activity_at=?,connection_state='CONNECTED',updated_at=? WHERE id=? AND last_session_id=?", (now,session.generation,now,now,session.gateway_id,session.session_id))
+    if updated.rowcount and previous and previous["connection_state"] != "CONNECTED":
+        store.event("GATEWAY_MODBUS_HEALTHY", f"Validated Modbus response on session generation {session.generation}", gateway_id=session.gateway_id, protocol=session.transport_mode, latency_ms=latency_ms,session_id=session.session_id,session_generation=session.generation,identity_method=session.commissioning_method,peer=session.peer)
 
 
 def _peer_allowed_for_identity(session):
@@ -134,7 +159,9 @@ async def authenticate_gateway_identity(session, identity):
             raise ValueError
         _, gateway_id, token = parts
         gateway = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
-        if (not gateway or gateway["transport_mode"] != "TRANSPARENT_SERIAL" or not gateway.get("registration_token_hash")
+        if (os.getenv("GATEWAY_LINK_IDENTITY_ENABLED", "false").lower() not in {"1","true","yes"}
+                or not gateway or "G781" not in (gateway.get("model") or "").upper()
+                or gateway["transport_mode"] != "TRANSPARENT_SERIAL" or not gateway.get("registration_token_hash")
                 or not _peer_allowed_for_identity(session)
                 or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), gateway["registration_token_hash"])):
             raise ValueError
@@ -251,6 +278,10 @@ def _measurement_quality(node, channel, measurement, items, channels):
 
 
 async def on_tcp_client(reader, writer):
+    await _handle_tcp_client(reader, writer)
+
+
+async def _handle_tcp_client(reader, writer, trusted_binding=None):
     pending = sum(1 for session in sessions.sessions.values() if not session.gateway_id and not session.closed)
     maximum = int(os.getenv("TCP_MAX_CONNECTIONS", "128"))
     if len(sessions.sessions) >= maximum or pending >= int(os.getenv("TCP_MAX_PENDING_SESSIONS", "32")):
@@ -272,18 +303,97 @@ async def on_tcp_client(reader, writer):
             pass
     session = GatewaySession(str(uuid4()), reader, writer, peer)
     session.peer_ip = peer_ip
-    sessions.sessions[session.session_id] = session
-    sessions.tasks[session.session_id] = asyncio.current_task()
-    store.event("PENDING", f"TCP connection awaiting explicit gateway assignment from {peer}", protocol="TCP")
+    session.on_modbus_success = on_gateway_modbus_success
+    if trusted_binding:
+        gateway_id = trusted_binding["gateway_id"]
+        if peer_ip != trusted_binding["trusted_peer_ip"]:
+            store.event("GATEWAY_IDENTITY_FAILED", f"Dedicated VPN ingress rejected unexpected peer {peer}; it does not match its provisioned WireGuard peer", gateway_id=gateway_id, protocol="TCP",peer=peer)
+            await session.retire()
+            return
+        gateway = store.one("SELECT * FROM gateways WHERE id=? AND auto_reconnect_enabled=1 AND trusted_ingress_id=? AND trusted_peer_ip=? AND listener_port=?", (gateway_id,trusted_binding["ingress_id"],peer_ip,trusted_binding["listener_port"]))
+        if not gateway:
+            store.event("GATEWAY_IDENTITY_FAILED", f"Dedicated VPN ingress from {peer} no longer matches persistent gateway binding", gateway_id=gateway_id, protocol="TCP",peer=peer)
+            await session.retire()
+            return
+        session.trusted_ingress_id = trusted_binding["ingress_id"]
+        sessions.sessions[session.session_id] = session
+        sessions.tasks[session.session_id] = asyncio.current_task()
+        store.event("GATEWAY_TCP_CONNECTED", f"Inbound TCP connection arrived on trusted ingress {trusted_binding['ingress_id']}", gateway_id=gateway_id, protocol="TCP",session_id=session.session_id,identity_method="WIREGUARD_INGRESS",peer=session.peer)
+        try:
+            await sessions.assign(session, gateway, identity_verified=True, commissioning_method="WIREGUARD_INGRESS")
+        except KeyError:
+            sessions.sessions.pop(session.session_id, None)
+            sessions.tasks.pop(session.session_id, None)
+            await session.retire()
+            return
+        store.event("GATEWAY_IDENTIFIED", f"Identity verified by authenticated VPN ingress {trusted_binding['ingress_id']}", gateway_id=gateway_id, protocol=session.transport_mode,session_id=session.session_id,session_generation=session.generation,identity_method="WIREGUARD_INGRESS",peer=session.peer)
+    else:
+        sessions.sessions[session.session_id] = session
+        sessions.tasks[session.session_id] = asyncio.current_task()
+        store.event("PENDING", f"TCP connection awaiting explicit gateway assignment from {peer}", protocol="TCP")
     await session.run_reader(on_disconnect, on_invalid_gateway_frame, authenticate_gateway_identity, on_unsolicited_gateway_frame)
     sessions.sessions.pop(session.session_id, None)
     sessions.tasks.pop(session.session_id, None)
+
+
+async def _start_trusted_ingress(gateway):
+    if not gateway.get("auto_reconnect_enabled"):
+        return None
+    if os.getenv("GATEWAY_TRUSTED_INGRESS_ENABLED", "false").lower() not in {"1", "true", "yes"}:
+        raise RuntimeError("GATEWAY_TRUSTED_INGRESS_ENABLED is required for automatic commissioning")
+    try:
+        host = ipaddress.ip_address(os.getenv("GATEWAY_TRUSTED_INGRESS_HOST", ""))
+        peer = ipaddress.ip_address(gateway["trusted_peer_ip"])
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Trusted ingress requires a specific private VPN interface host and peer IP") from exc
+    if host.is_unspecified or not host.is_private or not peer.is_private:
+        raise RuntimeError("Trusted ingress must bind a private VPN interface address and use a private peer address")
+    interface = os.getenv("GATEWAY_TRUSTED_INGRESS_INTERFACE", "")
+    if not _is_wireguard_interface_address(interface, str(host)):
+        raise RuntimeError("Trusted ingress host must be assigned to the configured WireGuard interface")
+    if not gateway.get("listener_port") or not gateway.get("trusted_ingress_id"):
+        raise RuntimeError("Persistent trusted ingress binding is incomplete")
+    if gateway["id"] in ingress_servers:
+        return ingress_servers[gateway["id"]]
+    binding = {"gateway_id": gateway["id"], "ingress_id": gateway["trusted_ingress_id"],
+               "listener_port": int(gateway["listener_port"]), "trusted_peer_ip": str(peer)}
+    server = await asyncio.start_server(lambda r,w: _handle_tcp_client(r,w,binding), str(host), int(gateway["listener_port"]), limit=65536)
+    ingress_servers[gateway["id"]] = server
+    store.run("UPDATE gateways SET connection_state='WAITING_FOR_RECONNECT',commissioning_state='WAITING_FOR_RECONNECT' WHERE id=?", (gateway["id"],))
+    store.event("GATEWAY_WAITING_FOR_RECONNECT", f"Listening on trusted VPN ingress {gateway['trusted_ingress_id']}", gateway_id=gateway["id"], protocol="TCP")
+    return server
+
+
+def _is_wireguard_interface_address(interface: str, expected_address: str) -> bool:
+    """Require the listener address to belong to an existing wg* interface."""
+    if not interface.startswith("wg"):
+        return False
+    try:
+        if interface not in {name for _, name in socket.if_nameindex()}:
+            return False
+        request = struct.pack("256s", interface.encode("ascii")[:15])
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            response = fcntl.ioctl(probe.fileno(), 0x8915, request)  # SIOCGIFADDR
+        actual = str(ipaddress.ip_address(response[20:24]))
+        return actual == expected_address
+    except (OSError, UnicodeEncodeError, ValueError):
+        return False
+
+
+async def _stop_trusted_ingress(gateway_id):
+    server = ingress_servers.pop(gateway_id, None)
+    if server:
+        server.close()
+        await server.wait_closed()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global tcp_server
     sessions.shutting_down = False
+    # A prior process's socket cannot survive a backend restart. Keep the
+    # persistent identity binding, but require a new session and Modbus proof.
+    store.run("UPDATE gateways SET connection_state=CASE WHEN auto_reconnect_enabled=1 THEN 'WAITING_FOR_RECONNECT' ELSE 'DISCONNECTED' END,commissioning_state=CASE WHEN auto_reconnect_enabled=1 THEN 'WAITING_FOR_RECONNECT' ELSE 'MANUAL_REQUIRED' END,identity_verified=0,last_disconnect_reason=CASE WHEN last_session_id IS NOT NULL THEN 'Backend restarted; a new session and Modbus verification are required' ELSE last_disconnect_reason END")
     host = os.getenv("TCP_LISTEN_HOST", "0.0.0.0")
     port = int(os.getenv("TCP_LISTEN_PORT", "5001"))
     cert_file, key_file = os.getenv("TCP_TLS_CERT_FILE"), os.getenv("TCP_TLS_KEY_FILE")
@@ -295,14 +405,24 @@ async def lifespan(app: FastAPI):
         ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_context.load_cert_chain(cert_file, key_file)
     tcp_server = await asyncio.start_server(on_tcp_client, host, port, limit=65536, ssl=ssl_context)
+    for gateway in store.rows("SELECT * FROM gateways WHERE auto_reconnect_enabled=1 ORDER BY id"):
+        try:
+            await _start_trusted_ingress(gateway)
+        except (OSError, RuntimeError, ValueError) as exc:
+            store.run("UPDATE gateways SET commissioning_state='INGRESS_UNAVAILABLE',connection_state='IDENTITY_FAILED',last_disconnect_reason=? WHERE id=?", (str(exc),gateway["id"]))
+            store.event("GATEWAY_IDENTITY_FAILED", f"Automatic ingress unavailable: {exc}", gateway_id=gateway["id"], protocol="TCP")
     scheduler.start()
     pipelines.start()
+    health_monitor.start()
     yield
     # Mark intentional shutdown before cancelling RTU transactions. Their
     # retired sessions must not trigger physical fail-safe writes.
     sessions.shutting_down = True
     await pipelines.stop()
     await scheduler.stop()
+    await health_monitor.stop()
+    for gateway_id in list(ingress_servers):
+        await _stop_trusted_ingress(gateway_id)
     tcp_server.close()
     await tcp_server.wait_closed()
     await sessions.shutdown()
@@ -347,6 +467,25 @@ class GatewayPatch(BaseModel):
     def valid_optional_mode(cls,value):
         if value is not None and value not in {"MODBUS_TCP","MODBUS_RTU","TRANSPARENT_SERIAL"}:
             raise ValueError("unsupported transport mode")
+        return value
+
+
+class TrustedIngressInput(BaseModel):
+    enabled: bool = True
+    ingress_id: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    listener_port: int | None = Field(default=None, ge=1024, le=65535)
+    trusted_peer_ip: str | None = None
+
+    @field_validator("trusted_peer_ip")
+    @classmethod
+    def private_peer_only(cls, value):
+        if value is not None:
+            try:
+                parsed = ipaddress.ip_address(value)
+            except ValueError as exc:
+                raise ValueError("trusted_peer_ip must be a valid VPN address") from exc
+            if not parsed.is_private:
+                raise ValueError("trusted_peer_ip must be a private VPN address")
         return value
 
 
@@ -566,12 +705,32 @@ async def list_gateways(_: str = Depends(authorize)):
         diagnostic=store.one("SELECT at,result,detail FROM events WHERE gateway_id=? ORDER BY id DESC LIMIT 1",(row["id"],))
         public["last_diagnostic"]=diagnostic
         session=sessions.for_gateway(row["id"])
-        public["connection_state"]="CONNECTED" if session else "DISCONNECTED"
-        public["commissioning_state"]="COMMISSIONED" if session else "PENDING_OR_DISCONNECTED"
-        public["identity_state"]="VERIFIED" if session and session.identity_verified else "OPERATOR_ASSOCIATED" if session else "NOT_VERIFIED"
+        public["connection_state"]=(row.get("connection_state") or "DISCONNECTED") if session else (row.get("connection_state") or ("WAITING_FOR_RECONNECT" if row.get("auto_reconnect_enabled") else "DISCONNECTED"))
+        public["commissioning_state"]="COMMISSIONED" if session else (row.get("commissioning_state") or ("WAITING_FOR_RECONNECT" if row.get("auto_reconnect_enabled") else "MANUAL_REQUIRED"))
         public["commissioning_method"]=session.commissioning_method if session else None
-        public["automatic_commissioning_available"]=bool(row.get("model","").upper().find("G781")>=0 and row.get("identity_method")=="G781_LINK_REGISTRATION" and row.get("transport_mode")=="TRANSPARENT_SERIAL")
-        public["manual_intervention_required"]=session is None
+        public["automatic_commissioning_available"]=bool(row.get("auto_reconnect_enabled") and row.get("trusted_ingress_id") and row.get("listener_port") and row["id"] in ingress_servers)
+        public["link_identity_available"]=bool(os.getenv("GATEWAY_LINK_IDENTITY_ENABLED","false").lower() in {"1","true","yes"} and "G781" in (row.get("model") or "").upper() and row.get("transport_mode")=="TRANSPARENT_SERIAL")
+        public["manual_intervention_required"]=session is None and not public["automatic_commissioning_available"]
+        public["session_id"]=session.session_id if session else row.get("last_session_id")
+        public["session_generation"]=session.generation if session else row.get("session_generation",0)
+        public["identity_state"]="VERIFIED" if session and session.identity_verified else "VPN_BINDING_PROVISIONED" if public["automatic_commissioning_available"] else "OPERATOR_ASSOCIATED" if session else "NOT_VERIFIED"
+        if not session:
+            public["gateway_modbus_state"] = "DISCONNECTED"
+        elif row.get("connection_state") == "DEGRADED":
+            public["gateway_modbus_state"] = "DEGRADED"
+        elif row.get("last_modbus_generation") != session.generation:
+            public["gateway_modbus_state"] = "MODBUS_VERIFYING"
+        else:
+            stamp = row.get("last_successful_modbus_at")
+            try:
+                last = datetime.fromisoformat(stamp) if stamp else None
+                if last and last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - last).total_seconds() if last else None
+                freshness = max(30, int(os.getenv("GATEWAY_MODBUS_FRESHNESS_SECONDS", "120")))
+                public["gateway_modbus_state"] = "RESPONDING" if age is not None and age <= freshness else "STALE"
+            except (TypeError, ValueError):
+                public["gateway_modbus_state"] = "UNKNOWN"
         public["last_modbus_transaction"]=store.one("SELECT at,result,function_code,address,quantity,latency_ms,detail FROM events WHERE gateway_id=? AND function_code IS NOT NULL ORDER BY id DESC LIMIT 1",(row["id"],))
         result.append(public)
     return result
@@ -596,8 +755,10 @@ async def create_gateway(data: GatewayCreate, actor=Depends(authorize)):
 async def rotate_gateway_registration_token(gateway_id: str, actor=Depends(authorize)):
     gateway=store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,))
     if not gateway: raise HTTPException(404,"Gateway not found")
-    if gateway["transport_mode"]!="TRANSPARENT_SERIAL":
-        raise HTTPException(422,"G781 LINK registration packets are only enabled for verified network-transparent RTU framing")
+    if os.getenv("GATEWAY_LINK_IDENTITY_ENABLED","false").lower() not in {"1","true","yes"}:
+        raise HTTPException(422,"In-band LINK identity is disabled until verified on the exact gateway firmware and framing; use the authenticated WireGuard ingress")
+    if "G781" not in (gateway.get("model") or "").upper() or gateway["transport_mode"]!="TRANSPARENT_SERIAL":
+        raise HTTPException(422,"G781 LINK registration is only available for a separately validated G781 network-transparent RTU configuration")
     token=secrets.token_urlsafe(32)
     store.run("UPDATE gateways SET registration_token_hash=?,identity_method='G781_LINK_REGISTRATION',updated_at=? WHERE id=?",(hashlib.sha256(token.encode()).hexdigest(),utc_now(),gateway_id))
     store.audit("ROTATE_GATEWAY_REGISTRATION_TOKEN","gateway",gateway_id,{"identity_method":"G781_LINK_REGISTRATION"},actor)
@@ -606,6 +767,57 @@ async def rotate_gateway_registration_token(gateway_id: str, actor=Depends(autho
     return {"gateway_id":gateway_id,"registration_packet":packet,"token_hex":packet_hex,"send_mode":"LINK",
             "configuration_commands":["AT+REGEN=ON","AT+REGTP=USER",f"AT+REGDT={packet_hex}","AT+REGSND=LINK"],
             "secret_returned_once":True,"tls_or_trusted_vpn_required":True}
+
+
+@app.put("/api/gateways/{gateway_id}/trusted-ingress")
+async def configure_trusted_ingress(gateway_id: str, data: TrustedIngressInput, actor=Depends(authorize)):
+    gateway = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
+    if not gateway:
+        raise HTTPException(404, "Gateway not found")
+    if data.enabled:
+        if os.getenv("GATEWAY_TRUSTED_INGRESS_ENABLED", "false").lower() not in {"1", "true", "yes"}:
+            raise HTTPException(503, "Configure GATEWAY_TRUSTED_INGRESS_ENABLED=true and bind a private WireGuard interface before provisioning automatic commissioning")
+        if not os.getenv("GATEWAY_TRUSTED_INGRESS_HOST"):
+            raise HTTPException(503, "GATEWAY_TRUSTED_INGRESS_HOST must be the private VPN interface address")
+        if not data.ingress_id or not data.listener_port or not data.trusted_peer_ip:
+            raise HTTPException(422, "ingress_id, listener_port and trusted_peer_ip are required")
+        try:
+            bind_ip = ipaddress.ip_address(os.environ["GATEWAY_TRUSTED_INGRESS_HOST"])
+        except ValueError as exc:
+            raise HTTPException(503, "GATEWAY_TRUSTED_INGRESS_HOST must be a specific private VPN address") from exc
+        if bind_ip.is_unspecified or not bind_ip.is_private:
+            raise HTTPException(503, "Automatic ingress must bind a private VPN interface address, never 0.0.0.0")
+        if data.listener_port == int(os.getenv("TCP_LISTEN_PORT", "5001")):
+            raise HTTPException(422, "Dedicated trusted ingress must use a port different from the shared commissioning listener")
+        occupied = store.one("SELECT id FROM gateways WHERE (listener_port=? OR trusted_ingress_id=? OR trusted_peer_ip=?) AND id<>?", (data.listener_port,data.ingress_id,data.trusted_peer_ip,gateway_id))
+        if occupied:
+            raise HTTPException(409, f"Trusted ingress binding is already assigned to gateway {occupied['id']}")
+        current_session = sessions.for_gateway(gateway_id)
+        if current_session and (gateway.get("trusted_ingress_id") != data.ingress_id or gateway.get("listener_port") != data.listener_port or gateway.get("trusted_peer_ip") != data.trusted_peer_ip):
+            raise HTTPException(409, "Disconnect the current gateway session before changing its trusted ingress binding")
+        values = (1,data.ingress_id,data.trusted_peer_ip,data.listener_port,"WIREGUARD_PEER_INGRESS","WAITING_FOR_RECONNECT","WAITING_FOR_RECONNECT",utc_now(),gateway_id)
+        try:
+            store.run("UPDATE gateways SET auto_reconnect_enabled=?,trusted_ingress_id=?,trusted_peer_ip=?,listener_port=?,identity_method=?,registration_token_hash=NULL,identity_verified=0,connection_state=?,commissioning_state=?,updated_at=? WHERE id=?", values)
+        except Exception as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise HTTPException(409, "Trusted ingress port is already reserved") from exc
+            raise
+        updated = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
+        try:
+            if (gateway.get("listener_port"),gateway.get("trusted_ingress_id"),gateway.get("trusted_peer_ip")) != (data.listener_port,data.ingress_id,data.trusted_peer_ip):
+                await _stop_trusted_ingress(gateway_id)
+            await _start_trusted_ingress(updated)
+        except (OSError, RuntimeError, ValueError) as exc:
+            store.run("UPDATE gateways SET auto_reconnect_enabled=0,connection_state='IDENTITY_FAILED',commissioning_state='INGRESS_UNAVAILABLE',last_disconnect_reason=?,updated_at=? WHERE id=?", (str(exc),utc_now(),gateway_id))
+            store.event("GATEWAY_IDENTITY_FAILED", f"Trusted ingress could not start: {exc}", gateway_id=gateway_id, protocol="TCP")
+            raise HTTPException(503, f"Trusted ingress could not start: {exc}") from exc
+    else:
+        await _stop_trusted_ingress(gateway_id)
+        active_session = sessions.for_gateway(gateway_id)
+        store.run("UPDATE gateways SET auto_reconnect_enabled=0,identity_verified=0,connection_state=?,commissioning_state=?,updated_at=? WHERE id=?", ("CONNECTED" if active_session else "DISCONNECTED","COMMISSIONED" if active_session else "SUSPENDED",utc_now(),gateway_id))
+    store.audit("CONFIGURE_TRUSTED_INGRESS", "gateway", gateway_id, {"enabled":data.enabled,"ingress_id":data.ingress_id,"listener_port":data.listener_port,"trusted_peer_ip":data.trusted_peer_ip,"trust":"WireGuard-authenticated peer on private interface"}, actor)
+    store.event("GATEWAY_WAITING_FOR_RECONNECT" if data.enabled else "GATEWAY_AUTO_COMMISSION_SUSPENDED", "Automatic commissioning enabled for the dedicated VPN ingress" if data.enabled else "Automatic commissioning suspended by administrator", gateway_id=gateway_id, protocol="TCP")
+    return _gateway_public(store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,)))
 
 
 @app.patch("/api/gateways/{gateway_id}")
@@ -641,10 +853,17 @@ async def disconnect_gateway(gateway_id: str, actor=Depends(authorize)):
     async with sessions.lock:
         if sessions.by_gateway.get(gateway_id) == session.session_id:
             sessions.by_gateway.pop(gateway_id, None)
-        await session.retire()
-        store.run("UPDATE gateways SET last_disconnected_at=?,last_disconnect_reason=?,updated_at=? WHERE id=?", (utc_now(),"Operator initiated disconnect",utc_now(),gateway_id))
+        session.state = "RETIRED"
+        session.closed = True
+        session.writer.close()
+        store.run("UPDATE gateways SET last_disconnected_at=?,last_disconnect_reason=?,connection_state=CASE WHEN auto_reconnect_enabled=1 THEN 'WAITING_FOR_RECONNECT' ELSE 'DISCONNECTED' END,commissioning_state=CASE WHEN auto_reconnect_enabled=1 THEN 'WAITING_FOR_RECONNECT' ELSE 'MANUAL_REQUIRED' END,identity_verified=0,updated_at=? WHERE id=?", (utc_now(),"Operator initiated disconnect",utc_now(),gateway_id))
+    try:
+        await session.writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
     await pipelines.gateway_disconnected(gateway_id, "Operator initiated disconnect", operator_initiated=True)
     store.event("OPERATOR_DISCONNECT", "Gateway session intentionally disconnected by an administrator", gateway_id=gateway_id, protocol=session.transport_mode)
+    store.event("GATEWAY_DISCONNECTED", "Operator intentionally disconnected the current TCP session; persistent registration remains", gateway_id=gateway_id, protocol=session.transport_mode,session_id=session.session_id,session_generation=session.generation,identity_method=session.commissioning_method,peer=session.peer)
     store.audit("DISCONNECT_SESSION", "gateway", gateway_id, {"session_id": session.session_id}, actor)
     return {"gateway_id": gateway_id, "session_id": session.session_id, "state": "DISCONNECTED"}
 
@@ -663,22 +882,33 @@ async def delete_gateway(gateway_id: str, actor=Depends(authorize)):
         node_names = ", ".join(node["name"] for node in nodes) or "none"
         pipeline_names = ", ".join(pipeline["name"] for pipeline in pipelines_for_gateway) or "none"
         raise HTTPException(409, f"Gateway has dependent nodes ({node_names}) and pipelines ({pipeline_names}). Disable/delete affected pipelines, then reassign or remove the nodes before deleting this gateway.")
-    session = sessions.for_gateway(gateway_id)
-    if session:
-        async with sessions.lock:
+    await _stop_trusted_ingress(gateway_id)
+    session = None
+    async with sessions.lock:
+        session = sessions.for_gateway(gateway_id)
+        if session:
             sessions.by_gateway.pop(gateway_id, None)
-            await session.retire()
-    with store.transaction() as db:
-        # Communication and audit history intentionally have no cascading FK.
-        db.execute("DELETE FROM gateways WHERE id=?", (gateway_id,))
-        db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",
-                   (utc_now(),actor,"DELETE","gateway",gateway_id,json.dumps({"name":gateway["name"],"registration_revoked":True},sort_keys=True)))
+            session.state = "RETIRED"
+            session.closed = True
+            session.writer.close()
+        with store.transaction() as db:
+            # Communication and audit history intentionally have no cascading FK.
+            db.execute("DELETE FROM gateways WHERE id=?", (gateway_id,))
+            db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",
+                       (utc_now(),actor,"DELETE","gateway",gateway_id,json.dumps({"name":gateway["name"],"registration_revoked":True},sort_keys=True)))
+    if session:
+        try:
+            await session.writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+        sessions.sessions.pop(session.session_id, None)
+        sessions.tasks.pop(session.session_id, None)
     store.event("GATEWAY_DELETED", f"Gateway {gateway['name']} deleted; registration credentials revoked", gateway_id=gateway_id)
 
 
 @app.get("/api/gateways/sessions")
 async def gateway_sessions(_: str = Depends(authorize)):
-    return [{"session_id":s.session_id,"peer":s.peer,"gateway_id":s.gateway_id,"transport_mode":s.transport_mode,"connected":s.connected,"commissioned":s.commissioned,"identity_verified":s.identity_verified,"commissioning_method":s.commissioning_method,"state":s.state,"last_activity":s.last_activity,"request_count":s.request_count} for s in sessions.sessions.values() if not s.closed]
+    return [{"session_id":s.session_id,"peer":s.peer,"gateway_id":s.gateway_id,"transport_mode":s.transport_mode,"connected":s.connected,"commissioned":s.commissioned,"identity_verified":s.identity_verified,"commissioning_method":s.commissioning_method,"trusted_ingress_id":s.trusted_ingress_id,"generation":s.generation,"state":s.state,"last_activity":s.last_activity,"request_count":s.request_count} for s in sessions.sessions.values() if not s.closed]
 
 
 @app.post("/api/gateways/sessions/{session_id}/assign/{gateway_id}")
@@ -1242,7 +1472,7 @@ async def mappings(_: str = Depends(authorize)):
 
 @app.get("/api/settings")
 async def settings(_: str = Depends(authorize)):
-    return {"tcp_listener":{"host":os.getenv("TCP_LISTEN_HOST","0.0.0.0"),"port":int(os.getenv("TCP_LISTEN_PORT","5001"))},"polling":{"minimum_interval_ms":250,"gateway_minimum_request_interval_ms":int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS","50")),"default_timeout_ms":1500,"max_retries":5},"freshness_seconds":int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),"event_retention_days":int(os.getenv("EVENT_RETENTION_DAYS","90")),"measurement_retention_days":int(os.getenv("MEASUREMENT_RETENTION_DAYS","365")),"output_timeouts":{"range_ms":int(store.setting("output_range_timeout_ms","5000")),"write_ms":int(store.setting("output_write_timeout_ms","5000")),"readback_ms":int(store.setting("output_readback_timeout_ms","5000"))},"hardware_writes":"ME31_AO_ONLY_AUTHORIZED_MANUAL_OR_ARMED_PIPELINE"}
+    return {"tcp_listener":{"host":os.getenv("TCP_LISTEN_HOST","0.0.0.0"),"port":int(os.getenv("TCP_LISTEN_PORT","5001"))},"trusted_ingress":{"enabled":os.getenv("GATEWAY_TRUSTED_INGRESS_ENABLED","false").lower() in {"1","true","yes"},"interface":os.getenv("GATEWAY_TRUSTED_INGRESS_INTERFACE") or None,"host":os.getenv("GATEWAY_TRUSTED_INGRESS_HOST") or None,"active_listeners":len(ingress_servers)},"gateway_healthcheck":{"enabled":health_monitor.enabled,"interval_seconds":health_monitor.interval,"timeout_ms":health_monitor.timeout_ms,"failure_threshold":health_monitor.failure_threshold},"polling":{"minimum_interval_ms":250,"gateway_minimum_request_interval_ms":int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS","50")),"default_timeout_ms":1500,"max_retries":5},"freshness_seconds":int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),"event_retention_days":int(os.getenv("EVENT_RETENTION_DAYS","90")),"measurement_retention_days":int(os.getenv("MEASUREMENT_RETENTION_DAYS","365")),"output_timeouts":{"range_ms":int(store.setting("output_range_timeout_ms","5000")),"write_ms":int(store.setting("output_write_timeout_ms","5000")),"readback_ms":int(store.setting("output_readback_timeout_ms","5000"))},"hardware_writes":"ME31_AO_ONLY_AUTHORIZED_MANUAL_OR_ARMED_PIPELINE"}
 
 
 @app.put("/api/settings/output-timeouts")

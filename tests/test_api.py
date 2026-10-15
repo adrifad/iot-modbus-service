@@ -46,12 +46,22 @@ class ApiTests(unittest.TestCase):
                         "id": gateway_id, "name": "Bench gateway", "model": "USR-G781", "transport_mode": "MODBUS_TCP"
                     })
                     self.assertEqual(created_gateway.status_code, 201)
+                    with patch.dict(os.environ, {"GATEWAY_TRUSTED_INGRESS_ENABLED":"false"}):
+                        insecure_auto = client.put(f"/api/gateways/{gateway_id}/trusted-ingress", headers=headers, json={
+                            "enabled": True, "ingress_id": "g781-vpn", "listener_port": 5101, "trusted_peer_ip": "10.70.0.11"
+                        })
+                    self.assertEqual(insecure_auto.status_code, 503)
+                    self.assertEqual(database.one("SELECT auto_reconnect_enabled FROM gateways WHERE id=?", (gateway_id,))["auto_reconnect_enabled"], 0)
                     transparent_id = str(uuid4())
                     transparent = client.post("/api/gateways", headers=headers, json={
                         "id": transparent_id, "name": "Transparent gateway", "model": "USR-G781", "transport_mode": "TRANSPARENT_SERIAL"
                     })
                     self.assertEqual(transparent.status_code, 201)
-                    registration = client.post(f"/api/gateways/{transparent_id}/registration-token", headers=headers, json={})
+                    with patch.dict(os.environ, {"GATEWAY_LINK_IDENTITY_ENABLED":"false"}):
+                        disabled_registration = client.post(f"/api/gateways/{transparent_id}/registration-token", headers=headers, json={})
+                    self.assertEqual(disabled_registration.status_code, 422)
+                    with patch.dict(os.environ, {"GATEWAY_LINK_IDENTITY_ENABLED":"true"}):
+                        registration = client.post(f"/api/gateways/{transparent_id}/registration-token", headers=headers, json={})
                     self.assertEqual(registration.status_code, 200, registration.text)
                     packet = registration.json()["registration_packet"]
                     token_value = packet.split(" ")[2].strip()
@@ -85,7 +95,7 @@ class ApiTests(unittest.TestCase):
                         wrong_packet = packet.replace(token_value, "invalid-token")
                         self.assertFalse(await service.authenticate_gateway_identity(invalid_identity, wrong_packet.strip().encode("ascii")))
                         self.assertIsNone(invalid_identity.gateway_id)
-                    with patch.dict(os.environ, {"GATEWAY_TRUSTED_CIDRS": "192.0.2.0/24"}):
+                    with patch.dict(os.environ, {"GATEWAY_TRUSTED_CIDRS": "192.0.2.0/24", "GATEWAY_LINK_IDENTITY_ENABLED":"true"}):
                         asyncio.run(identify_after_nat_reconnect())
                     self.assertEqual(database.one("SELECT reconnection_count FROM gateways WHERE id=?", (transparent_id,))["reconnection_count"], 1)
                     created_node = client.post("/api/nodes", headers=headers, json={

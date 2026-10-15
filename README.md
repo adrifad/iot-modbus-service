@@ -44,7 +44,7 @@ For the React console, run `cd web && npm install && npm run dev`. Vite forwards
    ```
 
 2. Configure the USR-G781 to connect to the VPS TCP listener. Confirm whether it forwards Modbus TCP ADUs or serial RTU bytes from its configured mode and document the matching `transport_mode`.
-3. Inspect `/api/gateways/sessions`. Either assign the pending session to the intended gateway using `POST /api/gateways/sessions/{session_id}/assign/{gateway_id}`, or—only if the deployed gateway mode supports the registration packet—request a registration token from `POST /api/gateways/{id}/registration-token`, configure the returned ASCII packet, and run the listener over TLS or the configured trusted VPN CIDR. The token is displayed once and stored as a hash. The verified G781 `MODBUS_TCP` conversion mode and W630 `TRANSPARENT_SERIAL` deployment have not been verified to support a non-disruptive identity handshake. Do not enable automatic token commissioning on either without bench validation. After loss of these sessions, a new connection remains pending until manually assigned. IP address and TCP source port are never identity.
+3. For first commissioning, inspect `/api/gateways/sessions` and assign the intended pending session using `POST /api/gateways/sessions/{session_id}/assign/{gateway_id}`. This operator association is persisted as gateway registration, but the shared listener never guesses identity for later connections.
 4. Register an AI node on a `MODBUS_TCP` gateway or an AO node on a `TRANSPARENT_SERIAL` gateway. The server assigns the fixed model/profile and creates six channels.
 5. Enable AI1–AI6 polling and verify actual input readings. For AO nodes, inspect the reported range and setpoints before any manual test.
 6. Create an I/O pipeline. It stays disabled and disarmed until it has a fresh source measurement and a responding AO node. Enable the definition, then explicitly arm output control. The backend will write only when both steps are complete.
@@ -53,10 +53,86 @@ Manual AO testing requires the administrator token and a separate in-page confir
 
 For transparent serial or RTU mode, serial settings are configured on gateway/device hardware. The software profile defaults to the requested 9600 8N1, but the TCP service cannot verify those physical settings from the socket.
 
+## Secure automatic reconnection
+
+The verified G781 Modbus TCP-conversion path and W630 transparent RTU-over-TCP path do not carry a verified, non-disruptive identity handshake. The service never inserts a registration preamble into either Modbus stream and never identifies a gateway by public source IP or ephemeral TCP port.
+
+Automatic recommissioning is available only through a dedicated listener bound to a private WireGuard interface address. The authenticated WireGuard peer is mapped to a unique private `/32`, a unique ingress ID, and a dedicated TCP port. The application verifies the listener's local address belongs to the configured `wg*` interface and matches the expected peer address. A private address without an authenticated tunnel and firewall isolation is not sufficient.
+
+For a direct-USR-LTE installation, an additional network prerequisite remains: the gateway's outbound TCP stream must be routed through an authenticated VPN peer or a trusted site-side VPN relay. The installed G781/W630 firmware configuration has not been verified to provide its own WireGuard, mutual TLS, or compatible identity handshake. If the DTU connects directly over carrier LTE to the public VPS, keep it on the shared listener and commission new sessions manually; do not provision automatic ingress based on carrier IP addresses.
+
+### VPS and network setup
+
+1. Install WireGuard on the VPS and a VPN-capable site router/relay. Example VPS peer configuration (replace key placeholders with generated keys; never put private keys in this repository):
+
+   ```ini
+   # /etc/wireguard/wg0.conf
+   [Interface]
+   Address = 10.70.0.1/24
+   ListenPort = 51820
+   PrivateKey = <VPS_PRIVATE_KEY>
+
+   [Peer]
+   PublicKey = <SITE_GATEWAY_PUBLIC_KEY>
+   AllowedIPs = 10.70.0.11/32
+   ```
+
+   Assign every gateway a distinct peer `/32` and key. A site relay that serves several DTUs needs per-device authenticated peers or equivalent network isolation and source binding; one shared NAT identity does not identify individual gateways.
+
+   A site relay's matching peer section uses its own private key and the VPS public key, with a route to the VPS tunnel address:
+
+   ```ini
+   [Interface]
+   Address = 10.70.0.11/24
+   PrivateKey = <SITE_PRIVATE_KEY>
+
+   [Peer]
+   PublicKey = <VPS_PUBLIC_KEY>
+   Endpoint = <VPS_PUBLIC_IP>:51820
+   AllowedIPs = 10.70.0.1/32
+   PersistentKeepalive = 25
+   ```
+2. Configure the site side with its peer key and route the specific DTU's TCP flow through the tunnel. If forwarding/NAT is used, make the VPS see that DTU's unique WireGuard peer address as the TCP source; WireGuard `AllowedIPs` must bind the address to the peer key. Configure the DTU's remote host as the VPN-routed VPS address and its dedicated listener port. Keep each unit's verified framing unchanged: G781 uses `MODBUS_TCP`; W630 uses `TRANSPARENT_SERIAL`.
+3. Set `/etc/iot-modbus-service.env`:
+
+   ```env
+   GATEWAY_TRUSTED_INGRESS_ENABLED=true
+   GATEWAY_TRUSTED_INGRESS_HOST=10.70.0.1
+   GATEWAY_TRUSTED_INGRESS_INTERFACE=wg0
+   GATEWAY_HEALTHCHECK_ENABLED=true
+   GATEWAY_HEALTHCHECK_INTERVAL_SECONDS=30
+   GATEWAY_HEALTHCHECK_TIMEOUT_MS=5000
+   GATEWAY_HEALTHCHECK_FAILURE_THRESHOLD=3
+   ```
+
+   The `wg0` interface and address must already exist before the service starts. The service rejects wildcard, public, or non-WireGuard listener addresses.
+4. Firewall each dedicated TCP port to accept traffic only on `wg0` and only from that gateway's WireGuard peer `/32`. Do not expose these ports on the public interface. Keep the shared port 5001 separate for initial/manual commissioning.
+5. Configure the G781 to connect to the VPN-routed VPS address and its dedicated port using its existing Modbus TCP conversion mode. Configure the W630 to connect to the same private VPS address on its own dedicated port using its existing transparent RTU-over-TCP mode. Do not add identity bytes or change the framing. The USR units' direct LTE path has not been verified to route through WireGuard; if they cannot reach the VPN address through an authenticated relay, use manual commissioning instead.
+6. In Settings → Gateway registry → Actions → Provision secure reconnect, register the unique peer address and a unique dedicated port for the gateway. For example, assign `10.70.0.11`, port `5101` to the G781 and a distinct WireGuard peer and port `5102` to the W630. The API reports `INGRESS_UNAVAILABLE` and refuses auto commissioning if the WireGuard interface prerequisite is missing.
+
+   The authenticated administrator API equivalent is:
+
+   ```sh
+   curl -X PUT -H "Authorization: Bearer $ADMIN_API_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"enabled":true,"ingress_id":"g781-wg","listener_port":5101,"trusted_peer_ip":"10.70.0.11"}' \
+     http://127.0.0.1:8000/api/gateways/gw-input-01/trusted-ingress
+   ```
+7. Disconnect and reconnect the DTUs through the VPN. Verify a new session generation, automatic commissioning, and a valid Modbus response. A reconnect never re-arms output pipelines; an operator must explicitly arm after checking source freshness and the fresh AO setpoint readback.
+
+Example firewall rule (repeat with a unique port and peer per gateway):
+
+```sh
+sudo ufw allow in on wg0 from 10.70.0.11 to 10.70.0.1 port 5101 proto tcp
+```
+
+Keep the host firewall's default inbound policy closed and do not add a public-interface allow rule for the dedicated port.
+
+Health checks default to read-only Modbus probes every 30 seconds after an idle period, with a 5-second request timeout and a three-failure degraded threshold. G781 probes use FC04 `0x0064`, quantity 6; W630 probes use FC03 range `0x0514`, quantity 6, and setpoint `0x0064`, quantity 6. No FC16 keepalives are sent. `TCP_IDLE_TIMEOUT_SECONDS` is deprecated and ignored; TCP keepalive supplements Modbus health checks.
+
 ## API surface
 
 - `GET /api/overview`, `/api/gateways`, `/api/nodes`, `/api/device-profiles`
-- `POST /api/gateways`, `PATCH/DELETE /api/gateways/{id}`, `POST /api/gateways/{id}/disconnect`, `POST /api/nodes`, `PATCH /api/nodes/{id}`
+- `POST /api/gateways`, `PATCH/DELETE /api/gateways/{id}`, `POST /api/gateways/{id}/disconnect`, `PUT /api/gateways/{id}/trusted-ingress`, `POST /api/nodes`, `PATCH /api/nodes/{id}`
 - `GET /api/nodes/{id}/outputs`, `POST /api/nodes/{id}/outputs/{channel}/set` (manual test requires `{ "target_ma": 12.5, "confirm": true }`)
 - `GET/POST /api/pipelines`, `GET/PATCH/DELETE /api/pipelines/{id}`, `POST /api/pipelines/{id}/enable`, `/disable`, `/arm`, `/disarm`, `GET /api/pipelines/{id}/status`, `/history`
 - `GET/POST /api/nodes/{id}/polling`, `PATCH/DELETE /api/polling/{id}`, `POST /api/polling/{id}/read`

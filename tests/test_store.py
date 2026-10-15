@@ -17,12 +17,15 @@ class StoreTests(unittest.TestCase):
             gateway_id = str(uuid4())
             first.run("INSERT INTO gateways(id,name,transport_mode,created_at,updated_at) VALUES(?,?,?,?,?)",
                       (gateway_id, "Persistent gateway", "MODBUS_TCP", now, now))
+            first.run("UPDATE gateways SET auto_reconnect_enabled=1,trusted_ingress_id='west-wg',trusted_peer_ip='10.70.0.11',listener_port=5101,session_generation=7,last_session_id='session-7',last_connected_at=? WHERE id=?",(now,gateway_id))
             first.close()
 
             second = Store(str(path))
             try:
                 self.assertEqual(second.one("SELECT name FROM gateways WHERE id=?", (gateway_id,))["name"], "Persistent gateway")
-                self.assertEqual(second.one("SELECT MAX(version) version FROM schema_migrations")["version"], 8)
+                binding=second.one("SELECT auto_reconnect_enabled,trusted_ingress_id,trusted_peer_ip,listener_port,session_generation,last_session_id FROM gateways WHERE id=?",(gateway_id,))
+                self.assertEqual(binding,{"auto_reconnect_enabled":1,"trusted_ingress_id":"west-wg","trusted_peer_ip":"10.70.0.11","listener_port":5101,"session_generation":7,"last_session_id":"session-7"})
+                self.assertEqual(second.one("SELECT MAX(version) version FROM schema_migrations")["version"], 13)
                 self.assertTrue(path.exists())
             finally:
                 second.close()
@@ -57,7 +60,7 @@ class StoreTests(unittest.TestCase):
                 migrated.close()
             reopened=Store(str(path))
             try:
-                self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],8)
+                self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],13)
                 self.assertEqual(reopened.one("SELECT COUNT(*) count FROM channels WHERE node_id='legacy-ao'")["count"],6)
             finally:
                 reopened.close()

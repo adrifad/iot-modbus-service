@@ -31,6 +31,8 @@ class GatewaySession:
     peer: str
     peer_ip: str | None = None
     gateway_id: str | None = None
+    generation: int = 0
+    trusted_ingress_id: str | None = None
     transport_mode: str | None = None
     identity_verified: bool = False
     commissioning_method: str = "NONE"
@@ -50,6 +52,7 @@ class GatewaySession:
     on_identity: object = None
     on_invalid_frame: object = None
     on_unsolicited_frame: object = None
+    on_modbus_success: object = None
 
     def __post_init__(self):
         self.is_tls = self.writer.get_extra_info("ssl_object") is not None
@@ -106,8 +109,10 @@ class GatewaySession:
             await on_close(self, failure)
 
     def _read_timeout(self):
-        value = float(os.getenv("TCP_IDLE_TIMEOUT_SECONDS", "0"))
-        return value if value > 0 else None
+        # Deprecated compatibility hook. A receive-side idle timeout is unsafe
+        # for transparent gateways because a stable setpoint can be silent.
+        # Modbus health checks and TCP keepalive now determine liveness.
+        return None
 
     async def _consume_identity(self, data: bytes) -> bytes:
         if self.identity_checked or self.gateway_id:
@@ -229,6 +234,10 @@ class GatewaySession:
                     await self._unsolicited(frame, "RTU unit/function did not match the active request")
             latency_ms = (time.perf_counter() - started) * 1000
             result = decoder(frame, transaction_id)
+            if self.on_modbus_success:
+                value = self.on_modbus_success(self, latency_ms)
+                if asyncio.iscoroutine(value):
+                    await value
             return result, frame, request, latency_ms
         except asyncio.TimeoutError as exc:
             latency_ms = (time.perf_counter() - started) * 1000
