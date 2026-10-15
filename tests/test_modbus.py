@@ -61,11 +61,32 @@ class ModbusCodecTests(unittest.TestCase):
     def test_float32_word_order_is_explicit(self):
         self.assertEqual(decode_registers([0x4148, 0x0000], "float32"), 12.5)
         self.assertEqual(decode_registers([0x0000, 0x4148], "float32", word_order="LITTLE_WORD_FIRST"), 12.5)
+        self.assertEqual(decode_registers([0x4841, 0x0000], "float32", byte_order="little"), 12.5)
+        self.assertEqual(decode_registers([0x0000, 0x4841], "float32", byte_order="little",
+                                          word_order="LITTLE_WORD_FIRST"), 12.5)
+        self.assertEqual(decode_registers([0x4148, 0x0000] * 6, "float32_array"), [12.5] * 6)
         with self.assertRaisesRegex(ModbusError, "not verified"):
             decode_registers([0x4148, 0x0000], "float32", word_order="unverified")
+        with self.assertRaisesRegex(ModbusError, "not finite"):
+            decode_registers([0x7FC0, 0x0000], "float32")
+        with self.assertRaisesRegex(ModbusError, "not finite"):
+            decode_registers([0x7F80, 0x0000], "float32")
         with self.assertRaisesRegex(ModbusError, "byte count"):
             decode_response("MODBUS_TCP", bytes.fromhex("00 01 00 00 00 04 01 04 01 00"),
                             unit_id=1, function_code=4, quantity=1, transaction_id=1)
+
+    def test_tcp_parser_recovers_after_invalid_mbap_header(self):
+        parser = StreamFrames.create("MODBUS_TCP")
+        good = bytes.fromhex("00 01 00 00 00 05 01 04 02 03 e8")
+        self.assertEqual(parser.push(bytes.fromhex("FF FF 00 01 00 00 00 00") + good), [good])
+        self.assertTrue(parser.errors)
+
+    def test_rtu_parser_discards_bad_crc_and_recovers(self):
+        parser = StreamFrames.create("TRANSPARENT_SERIAL")
+        good = with_crc(bytes.fromhex("01 04 02 03 e8"))
+        bad = good[:-1] + bytes((good[-1] ^ 0x01,))
+        self.assertEqual(parser.push(bad + good), [good])
+        self.assertTrue(any("CRC" in error for error in parser.errors))
 
 
 if __name__ == "__main__":

@@ -1,11 +1,15 @@
 """FastAPI control plane and lifecycle for the Modbus monitoring service."""
 
 import asyncio
+import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
 import secrets
+import socket
+import ssl
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .gateway import GatewaySession
+from .modbus import decode_registers
 from .profiles import PROFILES, register
 from .scheduler import PollScheduler
 from .store import Store, utc_now
@@ -27,9 +32,45 @@ class SessionRegistry:
     def __init__(self, store):
         self.store = store
         self.sessions: dict[str, GatewaySession] = {}
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.by_gateway: dict[str, str] = {}
+        self.lock = asyncio.Lock()
 
     def for_gateway(self, gateway_id):
-        return next((s for s in self.sessions.values() if s.gateway_id == gateway_id and not s.closed), None)
+        session = self.sessions.get(self.by_gateway.get(gateway_id, ""))
+        return session if session and session.commissioned else None
+
+    async def assign(self, session, gateway):
+        async with self.lock:
+            previous = self.for_gateway(gateway["id"])
+            if previous is session:
+                return
+            if previous:
+                previous.state = "RETIRED"
+                self.by_gateway.pop(gateway["id"], None)
+                await previous.retire()
+                self.store.event("SESSION_REPLACED", "Gateway session explicitly replaced during commissioning", gateway_id=gateway["id"],protocol=previous.transport_mode)
+            await session.commission(gateway["id"], gateway["transport_mode"])
+            self.by_gateway[gateway["id"]] = session.session_id
+            old_connected = gateway.get("last_connected_at") is not None
+            now = utc_now()
+            self.store.run("UPDATE gateways SET last_connected_at=?,last_activity_at=?,reconnection_count=reconnection_count+?,updated_at=? WHERE id=?", (now,now,int(old_connected),now,gateway["id"]))
+            self.store.event("RECONNECTED" if old_connected else "CONNECTED", f"Gateway session commissioned from {session.peer}", gateway_id=gateway["id"],protocol=session.transport_mode)
+
+    async def shutdown(self):
+        sessions = list(self.sessions.values())
+        for session in sessions:
+            await session.retire()
+        tasks = {task for task in self.tasks.values() if task is not asyncio.current_task() and not task.done()}
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=5)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self.sessions.clear()
+        self.tasks.clear()
+        self.by_gateway.clear()
 
 
 store = Store()
@@ -40,15 +81,136 @@ tcp_server = None
 
 async def on_disconnect(session, error=None):
     if session.gateway_id:
-        if error:
-            store.run("UPDATE gateways SET last_disconnected_at=?,connection_errors=connection_errors+1 WHERE id=?", (utc_now(),session.gateway_id))
-        else:
-            store.run("UPDATE gateways SET last_disconnected_at=? WHERE id=?", (utc_now(),session.gateway_id))
-        store.event("INVALID_RESPONSE" if error else "DISCONNECTED", error or "Gateway TCP session closed", gateway_id=session.gateway_id, protocol=session.transport_mode)
+        if sessions.by_gateway.get(session.gateway_id) == session.session_id:
+            sessions.by_gateway.pop(session.gateway_id, None)
+            store.run("UPDATE gateways SET last_disconnected_at=?,connection_errors=connection_errors+? WHERE id=?", (utc_now(),int(error is not None),session.gateway_id))
+            store.event("SESSION_DESYNCHRONIZED" if session.desynchronized else "DISCONNECTED", error or "Gateway TCP session closed", gateway_id=session.gateway_id, protocol=session.transport_mode)
+    elif session.state != "RETIRED":
+        store.event("PENDING_DISCONNECTED", "Uncommissioned TCP session closed", protocol="TCP")
 
 
 async def on_invalid_gateway_frame(session, detail):
     store.event("INVALID_RESPONSE", detail, gateway_id=session.gateway_id, protocol=session.transport_mode)
+
+
+async def on_unsolicited_gateway_frame(session, frame, detail):
+    store.event("UNSOLICITED_FRAME", detail, gateway_id=session.gateway_id, protocol=session.transport_mode,
+                direction="RX", response_hex=frame.hex(" "))
+
+
+def _peer_allowed_for_identity(session):
+    if session.is_tls:
+        return True
+    peer_ip = getattr(session, "peer_ip", "")
+    try:
+        address = ipaddress.ip_address(peer_ip)
+        networks = [ipaddress.ip_network(value.strip(), strict=False) for value in os.getenv("GATEWAY_TRUSTED_CIDRS", "").split(",") if value.strip()]
+        return any(address in network for network in networks)
+    except ValueError:
+        return False
+
+
+async def authenticate_gateway_identity(session, identity):
+    try:
+        parts = identity.decode("ascii").split(" ")
+        if len(parts) != 3 or parts[0] != "FIELDLINE/1":
+            raise ValueError
+        _, gateway_id, token = parts
+        gateway = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
+        if (not gateway or gateway["transport_mode"] != "TRANSPARENT_SERIAL" or not gateway.get("registration_token_hash")
+                or not _peer_allowed_for_identity(session)
+                or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), gateway["registration_token_hash"])):
+            raise ValueError
+        await sessions.assign(session, gateway)
+        store.audit("IDENTITY_COMMISSION","gateway",gateway_id,{"method":"G781_LINK_REGISTRATION","tls":session.is_tls},"gateway")
+        return True
+    except (UnicodeDecodeError, ValueError):
+        store.event("IDENTITY_REJECTED", "Gateway registration packet was invalid or arrived outside a trusted TLS/VPN path", protocol="TCP")
+        await session.retire()
+        return False
+
+
+def _item_freshness_seconds(item):
+    default = max(1, int(os.getenv("DEFAULT_STALE_AFTER_SECONDS", "30")))
+    return max(default, (int(item["interval_ms"]) * 2 + int(item["timeout_ms"])) / 1000)
+
+
+def _item_health(item, now=None):
+    now = now or datetime.now(timezone.utc)
+    if not item["enabled"]:
+        return "DISABLED"
+    if not item.get("last_success_at"):
+        return item["last_status"] if item["last_status"] in {"TIMEOUT","MODBUS_ERROR","INVALID_RESPONSE","DECODE_ERROR","DISCONNECTED"} else "UNKNOWN"
+    try:
+        last = datetime.fromisoformat(item["last_success_at"])
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if (now - last).total_seconds() > _item_freshness_seconds(item):
+        return "STALE"
+    if item["last_status"] != "GOOD":
+        return item["last_status"]
+    return "RESPONDING"
+
+
+def _node_modbus_health(node, items, gateway_connected):
+    if node["node_type"] == "ANALOG_OUTPUT":
+        return "UNKNOWN"
+    if not gateway_connected:
+        return "DISCONNECTED" if node.get("gateway_id") else "UNKNOWN"
+    if not node.get("polling_enabled"):
+        return "DISABLED"
+    enabled = [item for item in items if item["enabled"]]
+    if not enabled:
+        return "DISABLED"
+    states = [_item_health(item) for item in enabled]
+    for state in ("MODBUS_ERROR","INVALID_RESPONSE","DECODE_ERROR","POLL_ERROR","TIMEOUT","DISCONNECTED"):
+        if state in states:
+            return state
+    if "STALE" in states:
+        return "STALE"
+    if "UNKNOWN" in states:
+        return "UNKNOWN"
+    return "RESPONDING"
+
+
+def _measurement_quality(node, channel, measurement, items, channels):
+    if not node.get("polling_enabled"):
+        return "DISABLED"
+    channel_record = next((row for row in channels if row["channel_type"] == "ANALOG_INPUT" and row["channel_index"] == channel), None)
+    if not channel_record or not channel_record["enabled"]:
+        return "DISABLED"
+    mapped = []
+    for item in items:
+        try:
+            metadata=json.loads(item.get("measurement_metadata_json") or "{}")
+        except (TypeError,json.JSONDecodeError):
+            continue
+        if item["enabled"] and channel in metadata.get("channel_indices",[]):
+            mapped.append(item)
+    if not mapped:
+        return "DISABLED"
+    if not measurement:
+        return "UNKNOWN"
+    newest=max(mapped,key=lambda item:item.get("last_success_at") or "")
+    state=_item_health(newest)
+    if state in {"INVALID_RESPONSE","DECODE_ERROR","MODBUS_ERROR"}:
+        return "INVALID_RESPONSE"
+    if state in {"STALE","TIMEOUT","DISCONNECTED"}:
+        return "STALE"
+    if state in {"UNKNOWN","DISABLED"}:
+        return state
+    if measurement["quality"] == "OUT_OF_RANGE":
+        return "OUT_OF_RANGE"
+    try:
+        measured=datetime.fromisoformat(measurement["measured_at"])
+        if measured.tzinfo is None: measured=measured.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc)-measured).total_seconds()>_item_freshness_seconds(newest):
+            return "STALE"
+    except (TypeError,ValueError):
+        return "UNKNOWN"
+    return "GOOD"
 
 
 async def on_tcp_client(reader, writer):
@@ -60,12 +222,25 @@ async def on_tcp_client(reader, writer):
         except (ConnectionError,OSError): pass
         return
     peer_info = writer.get_extra_info("peername")
-    peer = f"{peer_info[0]}:{peer_info[1]}" if peer_info else "unknown"
+    peer_ip = str(peer_info[0]) if peer_info else "unknown"
+    peer = f"[{peer_info[0]}]:{peer_info[1]}" if peer_info and ":" in str(peer_info[0]) else f"{peer_ip}:{peer_info[1]}" if peer_info else "unknown"
+    sock = writer.get_extra_info("socket")
+    if sock:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, int(os.getenv("TCP_KEEPALIVE_IDLE_SECONDS", "60")))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(os.getenv("TCP_KEEPALIVE_INTERVAL_SECONDS", "15")))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, int(os.getenv("TCP_KEEPALIVE_COUNT", "4")))
+        except (AttributeError, OSError, ValueError):
+            pass
     session = GatewaySession(str(uuid4()), reader, writer, peer)
+    session.peer_ip = peer_ip
     sessions.sessions[session.session_id] = session
+    sessions.tasks[session.session_id] = asyncio.current_task()
     store.event("PENDING", f"TCP connection awaiting explicit gateway assignment from {peer}", protocol="TCP")
-    await session.run_reader(on_disconnect, on_invalid_gateway_frame)
+    await session.run_reader(on_disconnect, on_invalid_gateway_frame, authenticate_gateway_identity, on_unsolicited_gateway_frame)
     sessions.sessions.pop(session.session_id, None)
+    sessions.tasks.pop(session.session_id, None)
 
 
 @asynccontextmanager
@@ -73,13 +248,22 @@ async def lifespan(app: FastAPI):
     global tcp_server
     host = os.getenv("TCP_LISTEN_HOST", "0.0.0.0")
     port = int(os.getenv("TCP_LISTEN_PORT", "5001"))
-    tcp_server = await asyncio.start_server(on_tcp_client, host, port, limit=65536)
+    cert_file, key_file = os.getenv("TCP_TLS_CERT_FILE"), os.getenv("TCP_TLS_KEY_FILE")
+    ssl_context = None
+    if cert_file or key_file:
+        if not cert_file or not key_file:
+            raise RuntimeError("TCP_TLS_CERT_FILE and TCP_TLS_KEY_FILE must be configured together")
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_context.load_cert_chain(cert_file, key_file)
+    tcp_server = await asyncio.start_server(on_tcp_client, host, port, limit=65536, ssl=ssl_context)
     scheduler.start()
     yield
     await scheduler.stop()
     tcp_server.close()
     await tcp_server.wait_closed()
-    store.db.close()
+    await sessions.shutdown()
+    store.close()
 
 
 app = FastAPI(title="Industrial Modbus I/O Service", version="0.1.0", lifespan=lifespan)
@@ -97,7 +281,7 @@ async def authorize(authorization: str | None = Header(default=None)):
 
 
 class GatewayCreate(BaseModel):
-    id: str | None = Field(default=None, max_length=100)
+    id: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
     name: str = Field(min_length=1, max_length=100)
     model: str = Field(default="", max_length=100)
     transport_mode: str
@@ -204,6 +388,36 @@ class ChannelCreate(BaseModel):
     label: str = Field(min_length=1, max_length=80)
 
 
+class FloatVerificationInput(BaseModel):
+    channel: int = Field(ge=1, le=6)
+    reference_ma: float = Field(ge=0, le=30)
+    tolerance_ma: float = Field(default=0.1, gt=0, le=5)
+    byte_order: str
+    word_order: str
+
+    @field_validator("byte_order")
+    @classmethod
+    def valid_verification_byte_order(cls,value):
+        if value not in {"big","little"}: raise ValueError("byte order must be big or little")
+        return value
+
+    @field_validator("word_order")
+    @classmethod
+    def valid_word_order(cls,value):
+        if value not in {"BIG_WORD_FIRST","LITTLE_WORD_FIRST"}: raise ValueError("word order must be verified and selected")
+        return value
+
+
+class CalibrationCaptureInput(BaseModel):
+    tolerance_ma: float = Field(default=0.05, gt=0, le=2)
+
+    @field_validator("tolerance_ma")
+    @classmethod
+    def finite_capture_tolerance(cls, value):
+        if not math.isfinite(value): raise ValueError("capture tolerance must be finite")
+        return value
+
+
 class PreviewInput(BaseModel):
     raw_ma: float
     gain: float = Field(gt=0, le=10)
@@ -228,20 +442,30 @@ async def overview(_: str = Depends(authorize)):
     nodes = store.rows("SELECT * FROM nodes ORDER BY name")
     gateways = store.rows("SELECT * FROM gateways")
     latest = store.one("SELECT MAX(measured_at) AS at FROM measurements")
-    connected_gateway_ids = {s.gateway_id for s in sessions.sessions.values() if s.gateway_id and not s.closed}
-    freshness = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - int(os.getenv("DEFAULT_STALE_AFTER_SECONDS", "30")), timezone.utc).isoformat()
-    connected_modbus = {row["node_id"] for row in store.rows("SELECT node_id FROM polling_items WHERE last_status='GOOD' AND enabled=1 AND last_success_at IS NOT NULL AND last_success_at >= ?", (freshness,))}
+    connected_gateway_ids = {gateway["id"] for gateway in gateways if sessions.for_gateway(gateway["id"])}
     counts = {}
     for kind in ("ANALOG_INPUT", "ANALOG_OUTPUT"):
         typed = [node for node in nodes if node["node_type"] == kind]
-        counts[kind.lower()] = {"total": len(typed), "connected": sum(node["gateway_id"] in connected_gateway_ids for node in typed), "disconnected": sum(node["gateway_id"] not in connected_gateway_ids for node in typed)}
+        gateways_connected=sum(node["gateway_id"] in connected_gateway_ids for node in typed)
+        assigned=sum(node["gateway_id"] is not None for node in typed)
+        counts[kind.lower()] = {"total": len(typed), "connected": gateways_connected, "disconnected": assigned-gateways_connected,
+                                "unassigned":len(typed)-assigned,"gateway_connected":gateways_connected,"modbus_responding":0,"unhealthy":0,"health_unknown":0}
     item_stats = store.one("SELECT SUM(CASE WHEN p.enabled=1 AND n.polling_enabled=1 THEN 1 ELSE 0 END) active FROM polling_items p JOIN nodes n ON n.id=p.node_id") or {}
-    event_stats = store.one("SELECT SUM(CASE WHEN result='SUCCESS' THEN 1 ELSE 0 END) successful,SUM(CASE WHEN result IN ('TIMEOUT','DISCONNECTED','INVALID_RESPONSE','MODBUS_ERROR') THEN 1 ELSE 0 END) failed,AVG(CASE WHEN result='SUCCESS' THEN latency_ms END) avg_latency_ms FROM events") or {}
+    event_stats = store.one("SELECT SUM(CASE WHEN result IN ('SUCCESS','FLOAT_VERIFIED') THEN 1 ELSE 0 END) successful,SUM(CASE WHEN result IN ('TIMEOUT','DISCONNECTED','INVALID_RESPONSE','MODBUS_ERROR','DECODE_ERROR','POLL_ERROR','MEASUREMENT_PROCESSING_ERROR') THEN 1 ELSE 0 END) failed,AVG(CASE WHEN result='SUCCESS' THEN latency_ms END) avg_latency_ms FROM events") or {}
     node_summary = []
     for node in nodes:
         last = store.one("SELECT MAX(measured_at) at FROM measurements WHERE node_id=?", (node["id"],))
         item_count = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1", (node["id"],))["count"]
-        node_summary.append({**node,"gateway_connected":node["gateway_id"] in connected_gateway_ids,"modbus_healthy":node["id"] in connected_modbus,"last_measurement_at":last["at"],"enabled_channel_count":item_count})
+        items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node["id"],))
+        gateway_connected=node["gateway_id"] in connected_gateway_ids
+        health_state=_node_modbus_health(node,items,gateway_connected)
+        bucket=counts[node["node_type"].lower()]
+        if health_state=="RESPONDING": bucket["modbus_responding"]+=1
+        elif health_state not in {"UNKNOWN","DISABLED"}: bucket["unhealthy"]+=1
+        else: bucket["health_unknown"]+=1
+        node_summary.append({**node,"gateway_state":"CONNECTED" if gateway_connected else "DISCONNECTED" if node["gateway_id"] else "UNKNOWN",
+                             "gateway_connected":gateway_connected,"modbus_health":health_state,"modbus_healthy":health_state=="RESPONDING",
+                             "last_measurement_at":last["at"],"enabled_channel_count":item_count})
     return {"inputs":counts["analog_input"],"outputs":counts["analog_output"],"gateway_connections":{"total":len(gateways),"connected":len(connected_gateway_ids)},"polling":{"active":item_stats.get("active") or 0,"successful":event_stats.get("successful") or 0,"failed":event_stats.get("failed") or 0,"average_response_ms":event_stats.get("avg_latency_ms"),"state":"RUNNING" if scheduler.running else "STOPPED"},"last_measurement_at":latest["at"] if latest else None,"nodes":node_summary,"recent_events":store.rows("SELECT * FROM events ORDER BY id DESC LIMIT 8")}
 
 
@@ -261,6 +485,22 @@ async def create_gateway(data: GatewayCreate, actor=Depends(authorize)):
     return store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
 
 
+@app.post("/api/gateways/{gateway_id}/registration-token")
+async def rotate_gateway_registration_token(gateway_id: str, actor=Depends(authorize)):
+    gateway=store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,))
+    if not gateway: raise HTTPException(404,"Gateway not found")
+    if gateway["transport_mode"]!="TRANSPARENT_SERIAL":
+        raise HTTPException(422,"G781 LINK registration packets are only enabled for verified network-transparent RTU framing")
+    token=secrets.token_urlsafe(32)
+    store.run("UPDATE gateways SET registration_token_hash=?,identity_method='G781_LINK_REGISTRATION',updated_at=? WHERE id=?",(hashlib.sha256(token.encode()).hexdigest(),utc_now(),gateway_id))
+    store.audit("ROTATE_GATEWAY_REGISTRATION_TOKEN","gateway",gateway_id,{"identity_method":"G781_LINK_REGISTRATION"},actor)
+    packet=f"FIELDLINE/1 {gateway_id} {token}\r\n"
+    packet_hex=packet.encode().hex()
+    return {"gateway_id":gateway_id,"registration_packet":packet,"token_hex":packet_hex,"send_mode":"LINK",
+            "configuration_commands":["AT+REGEN=ON","AT+REGTP=USER",f"AT+REGDT={packet_hex}","AT+REGSND=LINK"],
+            "secret_returned_once":True,"tls_or_trusted_vpn_required":True}
+
+
 @app.patch("/api/gateways/{gateway_id}")
 async def patch_gateway(gateway_id: str, data: GatewayPatch, actor=Depends(authorize)):
     existing=store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,))
@@ -269,14 +509,14 @@ async def patch_gateway(gateway_id: str, data: GatewayPatch, actor=Depends(autho
     if "transport_mode" in changes and changes["transport_mode"] != existing["transport_mode"] and sessions.for_gateway(gateway_id):
         raise HTTPException(409,"Disconnect the commissioned session before changing transport framing")
     if changes:
-        store.db.execute(f"UPDATE gateways SET {','.join(key+'=?' for key in changes)},updated_at=? WHERE id=?",(*changes.values(),utc_now(),gateway_id));store.db.commit()
+        store.run(f"UPDATE gateways SET {','.join(key+'=?' for key in changes)},updated_at=? WHERE id=?",(*changes.values(),utc_now(),gateway_id))
         store.audit("UPDATE","gateway",gateway_id,changes,actor)
     return store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,))
 
 
 @app.get("/api/gateways/sessions")
 async def gateway_sessions(_: str = Depends(authorize)):
-    return [{"session_id":s.session_id,"peer":s.peer,"gateway_id":s.gateway_id,"transport_mode":s.transport_mode,"connected":not s.closed,"last_activity":getattr(s,"last_activity",None)} for s in sessions.sessions.values()]
+    return [{"session_id":s.session_id,"peer":s.peer,"gateway_id":s.gateway_id,"transport_mode":s.transport_mode,"connected":s.connected,"commissioned":s.commissioned,"state":s.state,"last_activity":s.last_activity,"request_count":s.request_count} for s in sessions.sessions.values() if not s.closed]
 
 
 @app.post("/api/gateways/sessions/{session_id}/assign/{gateway_id}")
@@ -285,16 +525,11 @@ async def assign_session(session_id: str, gateway_id: str, actor=Depends(authori
     gateway = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
     if not session or session.closed:
         raise HTTPException(404, "Pending TCP session not found")
+    if session.commissioned:
+        raise HTTPException(409,"TCP session is already commissioned")
     if not gateway:
         raise HTTPException(404, "Gateway not found")
-    if sessions.for_gateway(gateway_id):
-        raise HTTPException(409, "Gateway already has an active session")
-    session.gateway_id = gateway_id
-    session.transport_mode = gateway["transport_mode"]
-    session.parser = None
-    now = utc_now()
-    store.run("UPDATE gateways SET last_connected_at=?,last_activity_at=?,updated_at=? WHERE id=?", (now,now,now,gateway_id))
-    store.event("CONNECTED", f"Gateway session commissioned from {session.peer}", gateway_id=gateway_id, protocol=session.transport_mode)
+    await sessions.assign(session,gateway)
     store.audit("ASSIGN_SESSION","gateway",gateway_id,{"session_id":session_id,"peer":session.peer},actor)
     return {"gateway_id":gateway_id,"session_id":session_id,"transport_mode":session.transport_mode,"peer":session.peer}
 
@@ -302,14 +537,15 @@ async def assign_session(session_id: str, gateway_id: str, actor=Depends(authori
 @app.get("/api/nodes")
 async def list_nodes(type: str | None = Query(default=None), search: str | None = None, _: str = Depends(authorize)):
     nodes = store.rows("SELECT * FROM nodes ORDER BY name")
-    connected = {session.gateway_id for session in sessions.sessions.values() if session.gateway_id and not session.closed}
-    freshness=datetime.fromtimestamp(datetime.now(timezone.utc).timestamp()-int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),timezone.utc).isoformat()
+    connected = {gateway_id for gateway_id in sessions.by_gateway if sessions.for_gateway(gateway_id)}
     for node in nodes:
         node["enabled_channel_count"] = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1",(node["id"],))["count"]
         latest=store.one("SELECT MAX(measured_at) at FROM measurements WHERE node_id=?",(node["id"],))
         node["last_measurement_at"]=latest["at"]
         node["gateway_connected"]=node["gateway_id"] in connected
-        node["modbus_healthy"]=bool(store.one("SELECT id FROM polling_items WHERE node_id=? AND enabled=1 AND last_status='GOOD' AND last_success_at>=? LIMIT 1",(node["id"],freshness)))
+        node["gateway_state"]="CONNECTED" if node["gateway_connected"] else "DISCONNECTED" if node["gateway_id"] else "UNKNOWN"
+        node["modbus_health"]=_node_modbus_health(node,store.rows("SELECT * FROM polling_items WHERE node_id=?",(node["id"],)),node["gateway_connected"])
+        node["modbus_healthy"]=node["modbus_health"]=="RESPONDING"
     if type:
         nodes = [node for node in nodes if node["node_type"] == type]
     if search:
@@ -405,8 +641,10 @@ async def patch_node(node_id: str, changes: dict, actor=Depends(authorize)):
         raise HTTPException(422,"Slave ID must be 1–247")
     normalized = {key:(int(value) if key=="polling_enabled" else value.strip() if key in {"name","hardware_model"} and isinstance(value,str) else value) for key,value in changes.items()}
     if normalized:
-        store.db.execute(f"UPDATE nodes SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=?",(*normalized.values(),utc_now(),node_id)); store.db.commit()
+        store.run(f"UPDATE nodes SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=?",(*normalized.values(),utc_now(),node_id))
         store.audit("UPDATE","node",node_id,changes,actor)
+        if set(changes)&{"polling_enabled","gateway_id","slave_id"}:
+            scheduler.cancel_node(node_id)
     return store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
 
 
@@ -433,11 +671,21 @@ async def toggle_polling_group(node_id: str, category: str, enabled: bool = Quer
     if category == "Custom Registers":
         ids=store.rows("SELECT id FROM polling_items WHERE node_id=? AND profile_id IS NULL",(node_id,))
         store.run("UPDATE polling_items SET enabled=?,updated_at=? WHERE node_id=? AND profile_id IS NULL",(int(enabled),utc_now(),node_id))
+        for item in ids:
+            if enabled: scheduler.due[item["id"]]=0
+            else: scheduler.cancel_item(item["id"])
         store.audit("TOGGLE_POLLING_GROUP","node",node_id,{"group":category,"enabled":enabled,"items":[item["id"] for item in ids]},actor)
         return {"node_id":node_id,"group":category,"enabled":enabled,"updated_items":len(ids)}
     marks=','.join('?' for _ in selected)
     ids=store.rows(f"SELECT id FROM polling_items WHERE node_id=? AND register_name IN ({marks})",(node_id,*selected))
+    if enabled:
+        unverified=store.one(f"SELECT COUNT(*) count FROM polling_items WHERE node_id=? AND register_name IN ({marks}) AND data_type LIKE 'float%' AND float_verified=0",(node_id,*selected))
+        if unverified and unverified["count"]:
+            raise HTTPException(409,"Verify the ME31 float decoder before enabling this polling group")
     store.run(f"UPDATE polling_items SET enabled=?,updated_at=? WHERE node_id=? AND register_name IN ({marks})",(int(enabled),utc_now(),node_id,*selected))
+    for item in ids:
+        if enabled: scheduler.due[item["id"]]=0
+        else: scheduler.cancel_item(item["id"])
     store.audit("TOGGLE_POLLING_GROUP","node",node_id,{"group":category,"enabled":enabled,"items":[item["id"] for item in ids]},actor)
     return {"node_id":node_id,"group":category,"enabled":enabled,"updated_items":len(ids)}
 
@@ -459,12 +707,18 @@ async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authoriz
             raise HTTPException(422,"Polling settings do not match the selected profile definition")
         if definition.get("data_type") != data.data_type:
             raise HTTPException(422,"Polling data type does not match the selected profile definition")
-        if definition.get("word_order") == "unverified" and data.data_type.startswith("float"):
-            raise HTTPException(422,"Float word order requires real-device verification")
-    if data.data_type.startswith("float") and data.word_order not in {"BIG_WORD_FIRST", "LITTLE_WORD_FIRST"}:
-        raise HTTPException(422,"Float word order must be explicitly verified and selected")
+        if data.data_type.startswith("float") and definition.get("quantity") != data.quantity:
+            raise HTTPException(422,"Float polling quantity must match the register profile")
+    if data.data_type.startswith("float"):
+        if data.quantity % 2:
+            raise HTTPException(422,"Float32 polling quantity must be even")
+        if data.enabled:
+            raise HTTPException(422,"Float polling must be verified against a known reference before it is enabled")
+        if data.word_order not in {"BIG_WORD_FIRST", "LITTLE_WORD_FIRST", "unverified"}:
+            raise HTTPException(422,"Unsupported float word order")
     item_id,now=data.id or str(uuid4()),utc_now()
-    store.run("INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,byte_order,word_order,interval_ms,timeout_ms,retries,scale,unit,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(item_id,node_id,data.profile_id,data.register_name,data.function_code,data.address,data.quantity,data.data_type,data.byte_order,data.word_order,data.interval_ms,data.timeout_ms,data.retries,data.scale,data.unit,int(data.enabled),now,now))
+    measurement_metadata=definition.get("measurement",{}) if data.profile_id else {}
+    store.run("INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,byte_order,word_order,interval_ms,timeout_ms,retries,scale,unit,measurement_metadata_json,float_verified,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(item_id,node_id,data.profile_id,data.register_name,data.function_code,data.address,data.quantity,data.data_type,data.byte_order,data.word_order,data.interval_ms,data.timeout_ms,data.retries,data.scale,data.unit,json.dumps(measurement_metadata),0,int(data.enabled),now,now))
     store.audit("CREATE","polling_item",item_id,data.model_dump(),actor)
     return store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
 
@@ -474,10 +728,17 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
     item=store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
     if not item:
         raise HTTPException(404,"Polling item not found")
-    allowed={"enabled","interval_ms","timeout_ms","retries","scale","unit"}
+    allowed={"enabled","interval_ms","timeout_ms","retries","scale","unit","byte_order","word_order"}
     if set(changes)-allowed:
         raise HTTPException(422,"Polling register identity cannot be changed in-place")
     if "enabled" in changes and not isinstance(changes["enabled"],bool): raise HTTPException(422,"enabled must be boolean")
+    if "byte_order" in changes and changes["byte_order"] not in {"big","little"}: raise HTTPException(422,"Byte order must be big or little")
+    if "word_order" in changes and changes["word_order"] not in {"BIG_WORD_FIRST","LITTLE_WORD_FIRST","unverified"}: raise HTTPException(422,"Unsupported word order")
+    if ("byte_order" in changes or "word_order" in changes) and item["data_type"].startswith("float"):
+        changes["float_verified"] = False
+    if changes.get("enabled") and item["data_type"].startswith("float"):
+        if changes.get("word_order",item["word_order"]) == "unverified" or not item["float_verified"]:
+            raise HTTPException(422,"Verify float byte and word order against a known reference before enabling polling")
     if "enabled" in changes and changes["enabled"] and item["profile_id"]:
         definition=register(item["profile_id"],item["register_name"])
         if definition and definition.get("admin_only") and actor!="admin": raise HTTPException(403,"Administrator authorization required")
@@ -486,10 +747,14 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
     if "retries" in changes and (not isinstance(changes["retries"],int) or isinstance(changes["retries"],bool) or not 0 <= changes["retries"] <= 5): raise HTTPException(422,"Retries must be 0–5")
     if "scale" in changes and (not isinstance(changes["scale"],(int,float)) or isinstance(changes["scale"],bool) or not math.isfinite(changes["scale"])): raise HTTPException(422,"Scale must be a finite number")
     if "unit" in changes and (not isinstance(changes["unit"],str) or len(changes["unit"])>32): raise HTTPException(422,"Unit must be 32 characters or fewer")
-    normalized={key:(int(value) if key=="enabled" else value) for key,value in changes.items()}
+    normalized={key:(int(value) if key in {"enabled","float_verified"} else value) for key,value in changes.items()}
     if normalized:
-        store.db.execute(f"UPDATE polling_items SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=?",(*normalized.values(),utc_now(),item_id));store.db.commit()
+        store.run(f"UPDATE polling_items SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=?",(*normalized.values(),utc_now(),item_id))
         store.audit("UPDATE","polling_item",item_id,changes,actor)
+        if changes.get("enabled") is False:
+            scheduler.cancel_item(item_id)
+        elif changes.get("enabled") is True:
+            scheduler.due[item_id]=0
     return store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
 
 
@@ -497,6 +762,7 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
 async def delete_polling(item_id: str, actor=Depends(authorize)):
     item=store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
     if not item: raise HTTPException(404,"Polling item not found")
+    scheduler.cancel_item(item_id)
     store.run("DELETE FROM polling_items WHERE id=?",(item_id,));store.audit("DELETE","polling_item",item_id,{},actor)
 
 
@@ -507,6 +773,34 @@ async def read_once(item_id: str, _: str = Depends(authorize)):
     if not item["polling_enabled"]: raise HTTPException(409,"Node polling is disabled")
     await scheduler.read_once(item)
     return store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
+
+
+@app.post("/api/polling/{item_id}/verify-float")
+async def verify_float_order(item_id: str, data: FloatVerificationInput, actor=Depends(authorize)):
+    item=store.one("SELECT p.*,n.gateway_id,n.slave_id FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
+    if not item: raise HTTPException(404,"Polling item not found")
+    if item["data_type"]!="float32_array" or item["quantity"]!=12 or item["function_code"]!=4:
+        raise HTTPException(422,"Reference verification requires the six-channel ME31 Float32 input block")
+    if item["enabled"]: raise HTTPException(409,"Disable float polling before changing verified decoding settings")
+    session=sessions.for_gateway(item["gateway_id"])
+    if session is None: raise HTTPException(409,"No commissioned gateway session is available")
+    try:
+        registers,frame,request,latency=await session.read_registers(item["slave_id"],4,item["address"],12,item["timeout_ms"])
+        decoded=decode_registers(registers,"float32_array",byte_order=data.byte_order,word_order=data.word_order)
+    except Exception as exc:
+        store.event("FLOAT_VERIFICATION_ERROR",str(exc),gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=4,address=item["address"],quantity=12)
+        raise HTTPException(502,f"Float verification read failed: {exc}") from exc
+    observed=decoded[data.channel-1]*item["scale"]
+    packet=json.dumps([value*item["scale"] for value in decoded],allow_nan=False)
+    now=utc_now()
+    details={"channel":data.channel,"reference_ma":data.reference_ma,"observed_ma":observed,"tolerance_ma":data.tolerance_ma,"byte_order":data.byte_order,"word_order":data.word_order}
+    if abs(observed-data.reference_ma)>data.tolerance_ma:
+        store.event("FLOAT_VERIFICATION_FAILED",f"AI{data.channel} decoded {observed:.6g} mA; reference {data.reference_ma:.6g} mA",gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=4,address=item["address"],quantity=12,latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
+        return {"verified":False,**details}
+    store.run("UPDATE polling_items SET byte_order=?,word_order=?,float_verified=1,last_value=?,last_success_at=?,last_latency_ms=?,last_status='GOOD',updated_at=? WHERE id=?",(data.byte_order,data.word_order,packet,now,latency,now,item_id))
+    store.event("FLOAT_VERIFIED",f"AI{data.channel} matched known reference",gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=4,address=item["address"],quantity=12,latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
+    store.audit("VERIFY_FLOAT_ORDER","polling_item",item_id,details,actor)
+    return {"verified":True,**details,"byte_order":data.byte_order,"word_order":data.word_order}
 
 
 @app.post("/api/calibration/preview")
@@ -528,6 +822,37 @@ async def get_calibration(node_id: str, channel: int | None = None, _: str = Dep
     return store.rows(query+" ORDER BY channel,revision DESC",params)
 
 
+@app.post("/api/nodes/{node_id}/calibration/{channel}/capture")
+async def capture_calibration_sample(node_id: str, channel: int, data: CalibrationCaptureInput, _: str = Depends(authorize)):
+    node=store.one("SELECT * FROM nodes WHERE id=? AND node_type='ANALOG_INPUT'",(node_id,))
+    if not node: raise HTTPException(404,"Analog input node not found")
+    if channel not in range(1,7): raise HTTPException(422,"Channel must be AI1–AI6")
+    latest=store.one("SELECT * FROM measurements WHERE node_id=? AND channel=? ORDER BY id DESC LIMIT 1",(node_id,channel))
+    items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node_id,))
+    channels=store.rows("SELECT * FROM channels WHERE node_id=?",(node_id,))
+    quality=_measurement_quality(node,channel,latest,items,channels)
+    if quality!="GOOD": raise HTTPException(409,f"Cannot capture {quality.lower()} measurement")
+    samples=store.rows("SELECT raw_ma,measured_at FROM measurements WHERE node_id=? AND channel=? ORDER BY id DESC LIMIT 3",(node_id,channel))
+    if len(samples)<3: raise HTTPException(409,"Capture requires three recent valid samples")
+    try:
+        values=[float(sample["raw_ma"]) for sample in samples]
+        times=[datetime.fromisoformat(sample["measured_at"]) for sample in samples]
+        now=datetime.now(timezone.utc)
+        if any(timestamp.tzinfo is None for timestamp in times): times=[timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp for timestamp in times]
+        sample_age=(now-min(times)).total_seconds()
+        item=max((item for item in items if item["enabled"] and channel in json.loads(item["measurement_metadata_json"] or "{}").get("channel_indices",[])),key=lambda row:row.get("last_success_at") or "",default=None)
+        if not item or sample_age>_item_freshness_seconds(item): raise HTTPException(409,"Channel samples are stale or polling is disabled")
+        if (max(times)-min(times)).total_seconds()>(int(item["interval_ms"])*2+int(item["timeout_ms"]))/1000:
+            raise HTTPException(409,"The three samples are not consecutive recent polling results")
+    except (TypeError,ValueError,json.JSONDecodeError):
+        raise HTTPException(409,"Channel samples are invalid")
+    if not all(math.isfinite(value) for value in values): raise HTTPException(409,"Channel samples contain invalid values")
+    spread=max(values)-min(values)
+    if spread>data.tolerance_ma: raise HTTPException(409,f"Channel is not stable: sample spread {spread:.4f} mA exceeds {data.tolerance_ma:.4f} mA")
+    captured=sorted(values)[1]
+    return {"node_id":node_id,"channel":channel,"raw_ma":captured,"samples":len(values),"spread_ma":spread,"quality":"GOOD","captured_at":latest["measured_at"]}
+
+
 @app.put("/api/nodes/{node_id}/calibration")
 async def save_calibration(node_id: str, data: CalibrationInput, actor=Depends(authorize)):
     if not store.one("SELECT id FROM nodes WHERE id=? AND node_type='ANALOG_INPUT'",(node_id,)): raise HTTPException(404,"Analog input node not found")
@@ -535,9 +860,12 @@ async def save_calibration(node_id: str, data: CalibrationInput, actor=Depends(a
         from .calibration import Scaling, scale
         try: scale(0,Scaling(**data.scaling))
         except (TypeError,ValueError) as exc: raise HTTPException(422,str(exc))
-    revision=(store.one("SELECT MAX(revision) value FROM calibrations WHERE node_id=? AND channel=?",(node_id,data.channel))["value"] or 0)+1
-    store.run("INSERT INTO calibrations(node_id,channel,revision,gain,offset_ma,enabled,scaling_json,method,modified_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(node_id,data.channel,revision,data.gain,data.offset_ma,int(data.enabled),json.dumps(data.scaling) if data.scaling else None,data.method,actor,utc_now()))
-    store.audit("CALIBRATION_CHANGED","channel",f"{node_id}:{data.channel}",data.model_dump(),actor)
+    with store.transaction() as db:
+        current=db.execute("SELECT MAX(revision) value FROM calibrations WHERE node_id=? AND channel=?",(node_id,data.channel)).fetchone()["value"] or 0
+        revision=current+1
+        now=utc_now()
+        db.execute("INSERT INTO calibrations(node_id,channel,revision,gain,offset_ma,enabled,scaling_json,method,modified_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(node_id,data.channel,revision,data.gain,data.offset_ma,int(data.enabled),json.dumps(data.scaling) if data.scaling else None,data.method,actor,now))
+        db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",(now,actor,"CALIBRATION_CHANGED","channel",f"{node_id}:{data.channel}",json.dumps(data.model_dump(),sort_keys=True)))
     return store.one("SELECT * FROM calibrations WHERE node_id=? AND channel=? AND revision=?",(node_id,data.channel,revision))
 
 
@@ -563,16 +891,13 @@ async def revert_calibration(node_id: str, channel: int, revision: int, actor=De
 
 @app.get("/api/nodes/{node_id}/measurements/latest")
 async def latest_measurements(node_id: str, _: str = Depends(authorize)):
-    if not store.one("SELECT id FROM nodes WHERE id=?",(node_id,)): raise HTTPException(404,"Node not found")
+    node=store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
+    if not node: raise HTTPException(404,"Node not found")
     values=store.rows("SELECT m.* FROM measurements m JOIN (SELECT channel,MAX(id) id FROM measurements WHERE node_id=? GROUP BY channel) latest ON latest.id=m.id ORDER BY m.channel",(node_id,))
-    freshness=datetime.fromtimestamp(datetime.now(timezone.utc).timestamp()-int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),timezone.utc).isoformat()
-    node=store.one("SELECT polling_enabled FROM nodes WHERE id=?",(node_id,))
-    items=store.rows("SELECT register_name,enabled,last_status FROM polling_items WHERE node_id=?",(node_id,))
+    items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node_id,))
+    channels=store.rows("SELECT * FROM channels WHERE node_id=?",(node_id,))
     for value in values:
-        if value["measured_at"] < freshness:
-            value["quality"]="STALE"
-        if not node["polling_enabled"] or not any(item["enabled"] and item["register_name"] in {f"AI{value['channel']} current","AI current block"} for item in items):
-            value["quality"]="DISABLED"
+        value["quality"]=_measurement_quality(node,value["channel"],value,items,channels)
     return values
 
 
@@ -612,11 +937,32 @@ async def telemetry_socket(websocket: WebSocket):
         token=auth.get("token","") if isinstance(auth,dict) else ""
         if not isinstance(auth,dict) or auth.get("type")!="auth" or not isinstance(token,str) or not hmac.compare_digest(token,expected):
             await websocket.close(code=4401);return
+        await websocket.send_json({"type":"authenticated","at":utc_now()})
+        last_signature=None
+        last_heartbeat=0.0
         while True:
             latest=store.rows("SELECT m.* FROM measurements m JOIN (SELECT node_id,channel,MAX(id) id FROM measurements GROUP BY node_id,channel) v ON v.id=m.id ORDER BY m.node_id,m.channel")
-            await websocket.send_json({"type":"telemetry","at":utc_now(),"measurements":latest})
+            nodes={row["id"]:row for row in store.rows("SELECT * FROM nodes WHERE node_type='ANALOG_INPUT'")}
+            for measurement in latest:
+                node=nodes.get(measurement["node_id"])
+                if node:
+                    items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node["id"],))
+                    channels=store.rows("SELECT * FROM channels WHERE node_id=?",(node["id"],))
+                    measurement["quality"]=_measurement_quality(node,measurement["channel"],measurement,items,channels)
+            signature=tuple((row["id"],row["quality"]) for row in latest)
+            monotonic=time.monotonic()
+            if signature!=last_signature:
+                await websocket.send_json({"type":"telemetry","at":utc_now(),"measurements":latest})
+                last_signature=signature
+                last_heartbeat=monotonic
+            elif monotonic-last_heartbeat>=10:
+                await websocket.send_json({"type":"heartbeat","at":utc_now()})
+                last_heartbeat=monotonic
             await asyncio.sleep(1)
-    except (WebSocketDisconnect,RuntimeError):
+    except asyncio.TimeoutError:
+        try: await websocket.close(code=4408)
+        except RuntimeError: pass
+    except (WebSocketDisconnect,RuntimeError,ValueError):
         return
 
 
