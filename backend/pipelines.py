@@ -278,6 +278,10 @@ class PipelineService:
         return self.get(pipeline_id)
 
     async def arm(self, pipeline_id, confirm):
+        async with self._pipeline_lock(pipeline_id):
+            return await self._arm_locked(pipeline_id, confirm)
+
+    async def _arm_locked(self, pipeline_id, confirm):
         if not confirm:
             raise PipelineError("Explicit operator confirmation is required before output control can be armed")
         row = self.store.one("SELECT * FROM mappings WHERE id=?", (pipeline_id,))
@@ -300,18 +304,40 @@ class PipelineService:
         age = self._age_seconds(measurement["measured_at"])
         if age is None or age * 1000 > int(definition["config"].get("stale_timeout_ms", 10000)):
             raise PipelineError("Source measurement is older than the configured stale timeout")
+        source_value = self._source_value(measurement, row["source_value_type"])
+        if source_value is None or not math.isfinite(source_value):
+            raise PipelineError("A finite source value is required before arming")
+        try:
+            target = self._transform(source_value, definition["config"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise PipelineError(f"Source transformation is invalid: {exc}") from exc
+        if not math.isfinite(target):
+            raise PipelineError("Transformed output target must be finite")
+        destination_node = self.store.one("SELECT gateway_id FROM nodes WHERE id=?", (row["destination_node_id"],))
+        destination_session_before = self.sessions.for_gateway(destination_node["gateway_id"]) if destination_node and destination_node["gateway_id"] else None
+        if not destination_session_before:
+            raise PipelineError("Destination gateway is not connected and commissioned")
         async with self.output.lock_for(row["destination_node_id"], row["destination_channel"]):
             snapshot = await self.output.inspect(row["destination_node_id"])
             channel = snapshot["channels"][row["destination_channel"] - 1]
             if not channel["range_known"]:
                 raise PipelineError("Destination output range is unknown")
+            if not channel["output_min_ma"] <= target <= channel["output_max_ma"]:
+                raise PipelineError("Current source target is outside the destination's verified output range")
+            # last_acknowledged_value may be from a previous process/session.
+            # Seed deadband from this exact device readback and session
+            # generation. The next scheduler tick writes if target differs.
+            session = self.sessions.for_gateway(destination_node["gateway_id"])
+            if session is not destination_session_before:
+                raise PipelineError("Destination session changed during setpoint verification; retry arming after the new session is healthy")
+            current_setpoint = float(channel["setpoint_ma"])
             with self.store.transaction() as db:
                 owner = db.execute("SELECT id FROM mappings WHERE enabled=1 AND armed=1 AND destination_node_id=? AND destination_channel=? AND id<>?", (row["destination_node_id"], row["destination_channel"], pipeline_id)).fetchone()
                 if owner:
                     raise PipelineError("Another enabled pipeline owns this AO channel")
-                db.execute("UPDATE mappings SET armed=1,status='WAITING_FOR_SOURCE',last_error=NULL,failsafe_attempted=0,failsafe_status='NOT_APPLIED',consecutive_write_failures=0,faulted_at=NULL,updated_at=? WHERE id=? AND enabled=1", (utc_now(), pipeline_id))
+                db.execute("UPDATE mappings SET armed=1,status='WAITING_FOR_SOURCE',last_error=NULL,failsafe_attempted=0,failsafe_status='NOT_APPLIED',consecutive_write_failures=0,faulted_at=NULL,last_output_verified_setpoint_ma=?,last_output_verified_session_id=?,last_output_verified_generation=?,last_output_verified_at=?,last_raw_ma=?,last_calibrated_ma=?,last_engineering_value=?,source_quality=?,updated_at=? WHERE id=? AND enabled=1", (current_setpoint,session.session_id,session.generation,utc_now(),measurement.get("raw_ma"),measurement.get("calibrated_ma"),measurement.get("engineering_value"),measurement.get("quality"),utc_now(),pipeline_id))
         self._next_due[pipeline_id] = 0
-        self.store.audit("ARM", "pipeline", pipeline_id, {"destination_range": [channel["output_min_ma"], channel["output_max_ma"]]})
+        self.store.audit("ARM", "pipeline", pipeline_id, {"destination_range": [channel["output_min_ma"], channel["output_max_ma"]], "reported_setpoint_ma": current_setpoint, "target_ma": target, "session_generation": session.generation})
         return self.get(pipeline_id)
 
     async def disarm(self, pipeline_id, *, disable=False):
@@ -388,19 +414,23 @@ class PipelineService:
         if not math.isfinite(target):
             await self._transition_failure_locked(row, "SOURCE_INVALID", "Transformed output target is not finite", source_failure=True, measurement=measurement)
             return
-        previous = row["last_acknowledged_value"]
-        self._set_runtime(pipeline_id, "RUNNING", last_source_value=value, last_raw_ma=measurement.get("raw_ma"),
-                          last_calibrated_ma=measurement.get("calibrated_ma"), last_engineering_value=measurement.get("engineering_value"),
-                          source_quality=measurement.get("quality"), last_requested_value=target, last_error=None,
-                          failsafe_attempted=0, failsafe_status="NOT_APPLIED")
-        if previous is not None and abs(target - previous) <= float(config.get("deadband_ma", 0)):
-            return
         destination = self.store.one("SELECT * FROM nodes WHERE id=?", (row["destination_node_id"],))
         if not destination or destination["node_type"] != "ANALOG_OUTPUT" or not destination["polling_enabled"]:
             await self._transition_failure_locked(row, "CONFIGURATION_ERROR", "Destination output node is missing or disabled", source_failure=False, destination_failure=True, measurement=measurement)
             return
         if not destination["gateway_id"] or not self.sessions.for_gateway(destination["gateway_id"]):
             await self._transition_failure_locked(row, "OUTPUT_DISCONNECTED", "Destination gateway is disconnected; output command was not sent", source_failure=False, destination_failure=True, measurement=measurement)
+            return
+        destination_session = self.sessions.for_gateway(destination["gateway_id"])
+        if row.get("last_output_verified_generation") != destination_session.generation or row.get("last_output_verified_session_id") != destination_session.session_id:
+            await self._transition_failure_locked(row, "OUTPUT_DISCONNECTED", "Destination session changed since live setpoint verification; operator re-arm is required", source_failure=False, destination_failure=True, measurement=measurement)
+            return
+        previous = row.get("last_output_verified_setpoint_ma")
+        self._set_runtime(pipeline_id, "RUNNING", last_source_value=value, last_raw_ma=measurement.get("raw_ma"),
+                          last_calibrated_ma=measurement.get("calibrated_ma"), last_engineering_value=measurement.get("engineering_value"),
+                          source_quality=measurement.get("quality"), last_requested_value=target, last_error=None,
+                          failsafe_attempted=0, failsafe_status="NOT_APPLIED")
+        if previous is not None and abs(target - previous) <= float(config.get("deadband_ma", 0)):
             return
         attempts = int(config.get("retries", 1)) + 1
         last_error = None
@@ -413,6 +443,10 @@ class PipelineService:
                     last_calibrated_ma=measurement.get("calibrated_ma"), last_engineering_value=measurement.get("engineering_value"),
                     source_quality=measurement.get("quality"), last_requested_value=target,
                     last_acknowledged_value=result["acknowledged_ma"], last_success_at=result["updated_at"],
+                    last_output_verified_setpoint_ma=result["acknowledged_ma"],
+                    last_output_verified_session_id=destination_session.session_id,
+                    last_output_verified_generation=destination_session.generation,
+                    last_output_verified_at=result["updated_at"],
                     last_attempt_at=result["updated_at"], last_communication_at=result["updated_at"], last_error=None,
                     consecutive_write_failures=0, last_failed_target=None, faulted_at=None)
                 return
@@ -617,7 +651,8 @@ class PipelineService:
     def _set_runtime(self, pipeline_id, status, **values):
         allowed = {"last_source_value", "last_raw_ma", "last_calibrated_ma", "last_engineering_value", "source_quality",
                    "last_requested_value", "last_acknowledged_value", "last_success_at", "last_attempt_at", "last_communication_at",
-                   "last_error", "failsafe_attempted", "failsafe_status", "consecutive_write_failures", "last_failed_target", "faulted_at"}
+                   "last_error", "failsafe_attempted", "failsafe_status", "consecutive_write_failures", "last_failed_target", "faulted_at",
+                   "last_output_verified_session_id", "last_output_verified_generation", "last_output_verified_at", "last_output_verified_setpoint_ma"}
         if set(values) - allowed:
             raise ValueError("unsupported runtime field")
         values["status"] = status

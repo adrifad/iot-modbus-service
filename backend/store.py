@@ -213,6 +213,49 @@ class Store:
                     value = 5000
                 self.db.execute("INSERT OR IGNORE INTO system_settings(key,value,updated_at) VALUES(?,?,?)", (key,str(value),utc_now()))
             self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)", (utc_now(),))
+        if migration < 9:
+            self._ensure_column("gateways", "identity_method", "TEXT NOT NULL DEFAULT 'MANUAL'")
+            for name, declaration in (
+                ("auto_reconnect_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("trusted_ingress_id", "TEXT"),
+                ("trusted_peer_ip", "TEXT"),
+                ("listener_port", "INTEGER"),
+                ("identity_verified", "INTEGER NOT NULL DEFAULT 0"),
+                ("connection_state", "TEXT NOT NULL DEFAULT 'DISCONNECTED'"),
+                ("commissioning_state", "TEXT NOT NULL DEFAULT 'UNPROVISIONED'"),
+                ("session_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_session_id", "TEXT"),
+                ("last_reconnected_at", "TEXT"),
+                ("last_successful_modbus_at", "TEXT"),
+            ):
+                self._ensure_column("gateways", name, declaration)
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS gateways_listener_port_unique ON gateways(listener_port) WHERE listener_port IS NOT NULL")
+            # Existing records retain operator commissioning. No auto-trust is
+            # inferred from historical peers, source IPs, or credentials.
+            self.db.execute("UPDATE gateways SET commissioning_state=CASE WHEN identity_method='MANUAL' THEN 'MANUAL_REQUIRED' ELSE commissioning_state END")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)", (utc_now(),))
+            migration = 9
+        if migration < 10:
+            self._ensure_column("mappings", "last_output_verified_session_id", "TEXT")
+            self._ensure_column("mappings", "last_output_verified_generation", "INTEGER")
+            self._ensure_column("mappings", "last_output_verified_at", "TEXT")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(10,?)", (utc_now(),))
+            migration = 10
+        if migration < 11:
+            self._ensure_column("gateways", "last_modbus_generation", "INTEGER")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(11,?)", (utc_now(),))
+            migration = 11
+        if migration < 12:
+            self._ensure_column("events", "session_id", "TEXT")
+            self._ensure_column("events", "session_generation", "INTEGER")
+            self._ensure_column("events", "identity_method", "TEXT")
+            self._ensure_column("events", "peer", "TEXT")
+            self.db.execute("CREATE INDEX IF NOT EXISTS events_gateway_session ON events(gateway_id,session_generation,at DESC)")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(12,?)", (utc_now(),))
+            migration = 12
+        if migration < 13:
+            self._ensure_column("mappings", "last_output_verified_setpoint_ma", "REAL")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(13,?)", (utc_now(),))
         from .profiles import PROFILES
         for profile in PROFILES:
             self.db.execute("INSERT OR IGNORE INTO device_profiles(id,name,definition_json,created_at) VALUES(?,?,?,?)",
@@ -270,7 +313,7 @@ class Store:
                  (key, str(value), utc_now()))
 
     def event(self, result: str, detail: str, **kwargs):
-        fields = ["gateway_id", "node_id", "direction", "protocol", "function_code", "address", "quantity", "latency_ms", "request_hex", "response_hex", "pipeline_id", "source_node_id", "source_channel", "destination_node_id", "destination_channel", "classification"]
+        fields = ["gateway_id", "node_id", "direction", "protocol", "function_code", "address", "quantity", "latency_ms", "request_hex", "response_hex", "pipeline_id", "source_node_id", "source_channel", "destination_node_id", "destination_channel", "classification", "session_id", "session_generation", "identity_method", "peer"]
         values = [kwargs.get(field) for field in fields]
         self.run(f"INSERT INTO events(at,{','.join(fields)},result,detail) VALUES(?,{','.join('?' for _ in fields)},?,?)",
                  [utc_now(), *values, result, detail])

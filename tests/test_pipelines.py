@@ -132,6 +132,21 @@ class PipelineExecutionTests(unittest.IsolatedAsyncioTestCase):
         command = self.store.one("SELECT * FROM output_commands WHERE source=?", (f"PIPELINE:{pipeline_id}",))
         self.assertEqual(command["result"], "ACKNOWLEDGED")
 
+    async def test_rearm_uses_fresh_device_setpoint_instead_of_historical_ack(self):
+        self.setpoints[1] = 4000
+        pipeline = self.service.create(self.definition())
+        self.store.run("UPDATE mappings SET last_acknowledged_value=12.5 WHERE id=?", (pipeline["id"],))
+        await self.service.enable(pipeline["id"], True)
+        await self.service.arm(pipeline["id"], True)
+        armed = self.service.get(pipeline["id"])
+        self.assertAlmostEqual(armed["last_acknowledged_value"], 12.5)
+        self.assertAlmostEqual(armed["last_output_verified_setpoint_ma"], 4.0)
+        self.assertEqual(armed["last_output_verified_session_id"], self.output_session.session_id)
+        self.assertEqual(armed["last_output_verified_generation"], self.output_session.generation)
+        await self.service.execute(pipeline["id"])
+        self.assertEqual(len(self.fc16), 1)
+        self.assertAlmostEqual(struct.unpack(">f", self.fc16[0][7:11])[0], 12.5)
+
     async def test_engineering_source_requires_and_applies_explicit_two_point_transform(self):
         config={"transformation":"TWO_POINT","input_min":0,"input_max":100,"output_min_ma":4,"output_max_ma":20,
                 "update_interval_ms":1000,"deadband_ma":0,"stale_timeout_ms":5000,"timeout_ms":1000,"retries":0,"fail_safe_policy":"HOLD_LAST"}
