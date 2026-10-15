@@ -16,6 +16,35 @@ class Sessions:
 
 
 class SchedulerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_measurement_processing_failure_does_not_mark_poll_good(self):
+        store=Store(":memory:")
+        gateway_id,node_id,item_id=str(uuid4()),str(uuid4()),str(uuid4())
+        now=utc_now()
+        store.run("INSERT INTO gateways(id,name,transport_mode,created_at,updated_at) VALUES(?,?,?,?,?)",(gateway_id,"Gateway","MODBUS_TCP",now,now))
+        store.run("INSERT INTO nodes(id,name,node_type,gateway_id,slave_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(node_id,"AI","ANALOG_INPUT",gateway_id,1,now,now))
+        store.run("INSERT INTO channels(id,node_id,channel_index,channel_type,label,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(str(uuid4()),node_id,1,"ANALOG_INPUT","AI1",now,now))
+        store.run("INSERT INTO polling_items(id,node_id,register_name,function_code,address,quantity,data_type,interval_ms,timeout_ms,retries,scale,measurement_metadata_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (item_id,node_id,"Broken AI metadata",4,0x64,1,"uint16",1000,500,0,0.001,json.dumps({"type":"analog_current","channel_indices":[1,2],"conversion":"register_scale"}),1,now,now))
+
+        class ValidResponse:
+            transport_mode="MODBUS_TCP"
+            async def read_registers(self,*_args):
+                return [12000],bytes.fromhex("00 01 00 00 00 05 01 04 02 2E E0"),bytes.fromhex("00 01 00 00 00 06 01 04 00 64 00 01"),2.0
+        class Lookup:
+            def for_gateway(self,_gateway): return ValidResponse()
+        scheduler=PollScheduler(store,Lookup())
+        item=store.one("SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
+        try:
+            await scheduler.poll(item)
+            state=store.one("SELECT last_status,error_count FROM polling_items WHERE id=?",(item_id,))
+            self.assertEqual(state["last_status"],"MEASUREMENT_ERROR")
+            self.assertEqual(state["error_count"],1)
+            self.assertEqual(store.one("SELECT COUNT(*) count FROM measurements WHERE node_id=?",(node_id,))["count"],0)
+            self.assertEqual(store.one("SELECT COUNT(*) count FROM events WHERE result='SUCCESS'")["count"],1)
+            self.assertEqual(store.one("SELECT COUNT(*) count FROM events WHERE result='MEASUREMENT_PROCESSING_ERROR'")["count"],1)
+        finally:
+            store.close()
+
     async def test_simulated_modbus_tcp_read_persists_raw_and_calibrated_values(self):
         async def simulator(reader, writer):
             try:

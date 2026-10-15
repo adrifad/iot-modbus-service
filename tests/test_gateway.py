@@ -46,6 +46,7 @@ class GatewayLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new.peer, "203.0.113.9:51000")
         self.assertEqual(store.one("SELECT reconnection_count FROM gateways WHERE id=?", (gateway_id,))["reconnection_count"], 1)
         self.assertEqual(store.one("SELECT COUNT(*) count FROM events WHERE result='SESSION_REPLACED'")["count"], 1)
+        store.close()
 
     async def test_rtu_requests_for_multiple_slaves_are_serialized_per_gateway(self):
         active = 0

@@ -7,11 +7,20 @@ import socket
 import time
 from dataclasses import dataclass, field
 
-from .modbus import ModbusError, StreamFrames, build_request, decode_response
+from .modbus import (ModbusError, StreamFrames, build_me31_ao_write_request,
+                     build_request, decode_response, decode_write_ack)
 
 
 class TransportDesynchronized(ConnectionError):
     """An RTU reply timed out or was cancelled; late replies cannot be correlated."""
+
+
+class OutputReadbackError(ConnectionError):
+    """The FC16 acknowledgement was valid, but setpoint readback did not complete."""
+
+    def __init__(self, message, trace):
+        super().__init__(message)
+        self.trace = trace
 
 
 @dataclass
@@ -178,54 +187,109 @@ class GatewaySession:
             self.state = "DESYNCHRONIZED"
             self.writer.close()
 
+    async def _wait_transaction_locked(self, unit_id, function_code, request, timeout_ms, decoder):
+        if self.desynchronized:
+            raise TransportDesynchronized("RTU stream is desynchronized; reconnect and recommission gateway")
+        if self.closed or not self.commissioned:
+            raise ConnectionError("gateway session is not commissioned or connected")
+        minimum_gap = max(0, int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS", "50"))) / 1000
+        delay = minimum_gap - (time.perf_counter() - self.last_request_at)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        while not self.frames.empty():
+            stale = self.frames.get_nowait()
+            await self._unsolicited(stale, "frame arrived outside the active Modbus request")
+        transaction_id = int.from_bytes(request[:2], "big") if self.transport_mode == "MODBUS_TCP" else None
+        started = time.perf_counter()
+        try:
+            self.writer.write(request)
+            await self.writer.drain()
+        except (ConnectionError, OSError) as exc:
+            raise ConnectionError("gateway TCP write failed") from exc
+        self.last_request_at = time.perf_counter()
+        self.request_count += 1
+        deadline = time.perf_counter() + timeout_ms / 1000
+        try:
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                frame = await asyncio.wait_for(self.frames.get(), timeout=remaining)
+                if self.transport_mode == "MODBUS_TCP":
+                    if len(frame) >= 2 and int.from_bytes(frame[:2], "big") == transaction_id:
+                        break
+                    await self._unsolicited(frame, "Modbus TCP transaction identifier did not match the active request")
+                elif len(frame) >= 2 and frame[0] == unit_id and frame[1] in (function_code, function_code | 0x80):
+                    break
+                else:
+                    await self._unsolicited(frame, "RTU unit/function did not match the active request")
+            latency_ms = (time.perf_counter() - started) * 1000
+            result = decoder(frame, transaction_id)
+            return result, frame, request, latency_ms
+        except asyncio.TimeoutError as exc:
+            await self._desynchronize_rtu("RTU response timed out; session closed to quarantine delayed replies")
+            raise TimeoutError("Modbus response timed out") from exc
+        except asyncio.CancelledError:
+            await self._desynchronize_rtu("RTU transaction cancelled; session closed to quarantine delayed replies")
+            raise
+        except Exception as exc:
+            try:
+                exc.modbus_frame = frame
+            except Exception:
+                pass
+            raise
+
     async def read_registers(self, unit_id, function_code, address, quantity, timeout_ms):
         if self.desynchronized:
             raise TransportDesynchronized("RTU stream is desynchronized; reconnect and recommission gateway")
         if self.closed or not self.commissioned:
             raise ConnectionError("gateway session is not commissioned or connected")
         async with self.lock:
-            if self.closed:
-                raise ConnectionError("gateway session closed while waiting for the transaction lock")
-            minimum_gap = max(0, int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS", "50"))) / 1000
-            delay = minimum_gap - (time.perf_counter() - self.last_request_at)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            while not self.frames.empty():
-                stale = self.frames.get_nowait()
-                await self._unsolicited(stale, "frame arrived outside the active Modbus request")
             transaction_id = secrets.randbelow(65536)
             request = build_request(self.transport_mode, unit_id, function_code, address, quantity, transaction_id)
-            started = time.perf_counter()
+            decoder = lambda frame, tx: decode_response(
+                self.transport_mode, frame, unit_id=unit_id, function_code=function_code,
+                quantity=quantity, transaction_id=tx)
+            return await self._wait_transaction_locked(unit_id, function_code, request, timeout_ms, decoder)
+
+    async def write_me31_output_and_readback(self, unit_id, channel, value_ma, timeout_ms):
+        """Serialize the allowlisted FC16 output write and FC03 setpoint readback."""
+        if self.desynchronized:
+            raise TransportDesynchronized("RTU stream is desynchronized; reconnect and recommission gateway")
+        if self.closed or not self.commissioned:
+            raise ConnectionError("gateway session is not commissioned or connected")
+        async with self.lock:
+            transaction_id = secrets.randbelow(65536)
+            address = (channel - 1) * 2 if channel in range(1, 7) else -1
+            request = build_me31_ao_write_request(self.transport_mode, unit_id, channel, value_ma, transaction_id)
+            decoder = lambda frame, tx: decode_write_ack(
+                self.transport_mode, frame, unit_id=unit_id, address=address, quantity=2, transaction_id=tx)
             try:
-                self.writer.write(request)
-                await self.writer.drain()
-            except (ConnectionError, OSError) as exc:
-                raise ConnectionError("gateway TCP write failed") from exc
-            self.last_request_at = time.perf_counter()
-            self.request_count += 1
-            deadline = time.perf_counter() + timeout_ms / 1000
-            try:
-                while True:
-                    remaining = deadline - time.perf_counter()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError
-                    frame = await asyncio.wait_for(self.frames.get(), timeout=remaining)
-                    if self.transport_mode == "MODBUS_TCP":
-                        if len(frame) >= 2 and int.from_bytes(frame[:2], "big") == transaction_id:
-                            break
-                        await self._unsolicited(frame, "Modbus TCP transaction identifier did not match the active request")
-                    elif len(frame) >= 2 and frame[0] == unit_id and frame[1] in (function_code, function_code | 0x80):
-                        break
-                    else:
-                        await self._unsolicited(frame, "RTU unit/function did not match the active request")
-                latency_ms = (time.perf_counter() - started) * 1000
-                values = decode_response(self.transport_mode, frame, unit_id=unit_id,
-                                          function_code=function_code, quantity=quantity,
-                                          transaction_id=transaction_id if self.transport_mode == "MODBUS_TCP" else None)
-                return values, frame, request, latency_ms
-            except asyncio.TimeoutError as exc:
-                await self._desynchronize_rtu("RTU response timed out; session closed to quarantine delayed replies")
-                raise TimeoutError("Modbus response timed out") from exc
-            except asyncio.CancelledError:
-                await self._desynchronize_rtu("RTU transaction cancelled; session closed to quarantine delayed replies")
+                _, ack, write_request, write_latency = await self._wait_transaction_locked(
+                    unit_id, 16, request, timeout_ms, decoder)
+            except Exception as exc:
+                try:
+                    exc.trace = {"write_request": request, "acknowledgement": getattr(exc, "modbus_frame", None),
+                                 "write_latency_ms": None, "acknowledged": False}
+                except Exception:
+                    pass
                 raise
+            read_tx = secrets.randbelow(65536)
+            read_request = build_request(self.transport_mode, unit_id, 3, 0x0064, 6, read_tx)
+            read_decoder = lambda frame, tx: decode_response(
+                self.transport_mode, frame, unit_id=unit_id, function_code=3, quantity=6, transaction_id=tx)
+            try:
+                values, readback_frame, _, read_latency = await self._wait_transaction_locked(
+                    unit_id, 3, read_request, timeout_ms, read_decoder)
+            except Exception as exc:
+                raise OutputReadbackError(str(exc), {"acknowledgement": ack, "write_request": write_request,
+                    "write_latency_ms": write_latency, "readback_request": read_request, "acknowledged": True}) from exc
+            return {
+                "acknowledgement": ack,
+                "write_request": write_request,
+                "write_latency_ms": write_latency,
+                "readback_frame": readback_frame,
+                "readback_request": read_request,
+                "readback_latency_ms": read_latency,
+                "readback_ma": values[channel - 1] / 1000.0,
+            }

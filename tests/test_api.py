@@ -23,6 +23,8 @@ class ApiTests(unittest.TestCase):
             service.store = database
             service.scheduler.store = database
             service.sessions.store = database
+            service.output_driver.store = database
+            service.pipelines.store = database
             token = "test-administrator-token"
             with patch.dict(os.environ, {"ADMIN_API_TOKEN": token, "TCP_LISTEN_HOST": "127.0.0.1", "TCP_LISTEN_PORT": "0"}):
                 with TestClient(service.app) as client:
@@ -131,6 +133,11 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(verified.status_code, 200, verified.text)
                     self.assertTrue(verified.json()["verified"])
                     self.assertEqual(client.patch(f"/api/polling/{float_item.json()['id']}", headers=headers, json={"enabled": True}).json()["enabled"], 1)
+                    changed_decoder=client.patch(f"/api/polling/{float_item.json()['id']}",headers=headers,json={"word_order":"LITTLE_WORD_FIRST"})
+                    self.assertEqual(changed_decoder.status_code,200,changed_decoder.text)
+                    self.assertEqual(changed_decoder.json()["enabled"],0)
+                    self.assertEqual(changed_decoder.json()["float_verified"],0)
+                    self.assertEqual(client.patch(f"/api/polling/{float_item.json()['id']}",headers=headers,json={"enabled":True}).status_code,422)
 
                     ai2 = client.post(f"/api/nodes/{node_id}/polling", headers=headers, json={
                         "profile_id": "ebyte-me31-xaxx0600-v1.1", "register_name": "AI2 current",
@@ -171,6 +178,80 @@ class ApiTests(unittest.TestCase):
                     with client.websocket_connect("/ws/telemetry") as websocket:
                         websocket.send_json({"type": "auth", "token": token})
                         self.assertEqual(websocket.receive_json()["type"], "authenticated")
+
+    def test_fixed_me31_profiles_gateway_lifecycle_and_pipeline_ownership(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database=Store(os.path.join(temp,"pipelines.db"))
+            if service.store is not database:
+                try: service.store.close()
+                except Exception: pass
+            service.store=database
+            service.scheduler.store=database
+            service.sessions.store=database
+            service.sessions.sessions.clear();service.sessions.tasks.clear();service.sessions.by_gateway.clear()
+            service.output_driver.store=database;service.pipelines.store=database
+            token="test-pipeline-administrator-token"
+            with patch.dict(os.environ,{"ADMIN_API_TOKEN":token,"TCP_LISTEN_HOST":"127.0.0.1","TCP_LISTEN_PORT":"0"}):
+                with TestClient(service.app) as client:
+                    headers={"Authorization":f"Bearer {token}"}
+                    input_gateway=client.post("/api/gateways",headers=headers,json={"name":"Input G781","model":"USR-G781","transport_mode":"MODBUS_TCP"}).json()
+                    output_gateway=client.post("/api/gateways",headers=headers,json={"name":"Output W630","model":"USR-W630","transport_mode":"TRANSPARENT_SERIAL"}).json()
+                    input_node=client.post("/api/nodes",headers=headers,json={"name":"ME31 AI","node_type":"ANALOG_INPUT","gateway_id":input_gateway["id"],"slave_id":1}).json()
+                    output_response=client.post("/api/nodes",headers=headers,json={"name":"ME31 AO","node_type":"ANALOG_OUTPUT","gateway_id":output_gateway["id"],"slave_id":1})
+                    self.assertEqual(output_response.status_code,201,output_response.text)
+                    output_node=output_response.json()
+                    self.assertEqual(output_node["hardware_model"],"EBYTE ME31-XXXA0006")
+                    self.assertEqual(output_node["profile_id"],"ebyte-me31-xxxa0006-v1.1")
+                    channels=client.get(f"/api/nodes/{output_node['id']}/channels",headers=headers).json()
+                    self.assertEqual([channel["label"] for channel in channels],[f"AO{i}" for i in range(1,7)])
+                    invalid=client.post("/api/nodes",headers=headers,json={"name":"Wrong model","node_type":"ANALOG_OUTPUT","hardware_model":"Other AO","gateway_id":output_gateway["id"]})
+                    self.assertEqual(invalid.status_code,422)
+                    no_manual_confirm=client.post(f"/api/nodes/{output_node['id']}/outputs/1/set",headers=headers,json={"target_ma":4})
+                    self.assertEqual(no_manual_confirm.status_code,422)
+
+                    definition={"name":"AI1 to AO2","source_node_id":input_node["id"],"source_channel":1,
+                        "destination_node_id":output_node["id"],"destination_channel":2,"source_value_type":"CALIBRATED_MA",
+                        "config":{"transformation":"DIRECT","update_interval_ms":1000,"deadband_ma":0.05,"stale_timeout_ms":10000,
+                            "timeout_ms":2000,"retries":1,"fail_safe_policy":"HOLD_LAST"}}
+                    first=client.post("/api/pipelines",headers=headers,json=definition)
+                    self.assertEqual(first.status_code,201,first.text)
+                    first_id=first.json()["id"]
+                    self.assertFalse(first.json()["enabled"])
+                    self.assertFalse(first.json()["armed"])
+                    compatibility=client.get("/api/mappings",headers=headers).json()
+                    self.assertIn("items",compatibility)
+                    self.assertEqual(compatibility["items"][0]["config_json"]["transformation"],"DIRECT")
+                    second=client.post("/api/pipelines",headers=headers,json={**definition,"name":"AI3 to AO2","source_channel":3})
+                    self.assertEqual(second.status_code,201,second.text)
+                    self.assertEqual(client.post(f"/api/pipelines/{first_id}/enable",headers=headers,json={"confirm":True}).status_code,200)
+                    second_enabled=client.post(f"/api/pipelines/{second.json()['id']}/enable",headers=headers,json={"confirm":True})
+                    self.assertEqual(second_enabled.status_code,200,second_enabled.text)
+                    self.assertFalse(second_enabled.json()["armed"])
+                    self.assertEqual(client.post(f"/api/pipelines/{first_id}/disable",headers=headers).status_code,200)
+                    self.assertEqual(client.post(f"/api/pipelines/{second.json()['id']}/enable",headers=headers,json={"confirm":True}).status_code,200)
+                    self.assertEqual(client.patch(f"/api/gateways/{output_gateway['id']}",headers=headers,json={"transport_mode":"MODBUS_TCP"}).status_code,409)
+                    blocked=client.delete(f"/api/gateways/{output_gateway['id']}",headers=headers)
+                    self.assertEqual(blocked.status_code,409)
+                    self.assertIn("ME31 AO",blocked.json()["detail"])
+
+                    unused=client.post("/api/gateways",headers=headers,json={"name":"Unused","model":"USR-W630","transport_mode":"TRANSPARENT_SERIAL"}).json()
+                    class PendingWriter:
+                        def get_extra_info(self,_name): return None
+                        def close(self): pass
+                        async def wait_closed(self): pass
+                    pending=GatewaySession("pending-session",None,PendingWriter(),"192.0.2.10:4000")
+                    pending.state="UNCOMMISSIONED"
+                    service.sessions.sessions[pending.session_id]=pending
+                    assigned=client.post(f"/api/gateways/sessions/{pending.session_id}/assign/{unused['id']}",headers=headers,json={})
+                    self.assertEqual(assigned.status_code,200,assigned.text)
+                    self.assertTrue(pending.commissioned)
+                    already=client.post(f"/api/gateways/sessions/{pending.session_id}/assign/{unused['id']}",headers=headers,json={})
+                    self.assertEqual(already.status_code,409)
+                    disconnected=client.post(f"/api/gateways/{unused['id']}/disconnect",headers=headers,json={})
+                    self.assertEqual(disconnected.status_code,200,disconnected.text)
+                    self.assertIsNone(service.sessions.for_gateway(unused["id"]))
+                    self.assertEqual(client.delete(f"/api/gateways/{unused['id']}",headers=headers).status_code,204)
+                    self.assertIsNone(database.one("SELECT id FROM gateways WHERE id=?",(unused["id"],)))
 
 
 if __name__ == "__main__":

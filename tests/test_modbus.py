@@ -2,7 +2,7 @@ import unittest
 
 from backend.modbus import (
     ModbusError, ModbusExceptionResponse, StreamFrames, build_request, decode_registers,
-    crc16, decode_response, with_crc,
+    build_me31_ao_write_request, crc16, decode_response, decode_write_ack, with_crc,
 )
 
 
@@ -87,6 +87,36 @@ class ModbusCodecTests(unittest.TestCase):
         bad = good[:-1] + bytes((good[-1] ^ 0x01,))
         self.assertEqual(parser.push(bad + good), [good])
         self.assertTrue(any("CRC" in error for error in parser.errors))
+
+    def test_me31_ao_fc16_float_encoding_and_rtu_crc(self):
+        request = build_me31_ao_write_request("TRANSPARENT_SERIAL", 1, 2, 12.5)
+        self.assertEqual(request[:7], bytes.fromhex("01 10 00 02 00 02 04"))
+        self.assertEqual(request[7:11], bytes.fromhex("41 48 00 00"))
+        self.assertEqual(crc16(request[:-2]), int.from_bytes(request[-2:], "little"))
+
+    def test_me31_ao_fc16_tcp_frame_and_acknowledgement_validation(self):
+        request = build_me31_ao_write_request("MODBUS_TCP", 1, 2, 12.5, transaction_id=0x1234)
+        self.assertEqual(request, bytes.fromhex("12 34 00 00 00 0B 01 10 00 02 00 02 04 41 48 00 00"))
+        response = bytes.fromhex("12 34 00 00 00 06 01 10 00 02 00 02")
+        decode_write_ack("MODBUS_TCP", response, unit_id=1, address=2, transaction_id=0x1234)
+        with self.assertRaises(ModbusError):
+            decode_write_ack("MODBUS_TCP", response, unit_id=1, address=4, transaction_id=0x1234)
+        with self.assertRaises(ModbusError):
+            decode_write_ack("MODBUS_TCP", response, unit_id=1, address=2, transaction_id=0x9999)
+
+    def test_me31_ao_fc16_exception_and_allowlist_validation(self):
+        exception = with_crc(bytes.fromhex("01 90 02"))
+        with self.assertRaises(ModbusExceptionResponse):
+            decode_write_ack("TRANSPARENT_SERIAL", exception, unit_id=1, address=0)
+        for channel, value in ((0, 10), (7, 10), (1, float("nan")), (1, 25.1)):
+            with self.assertRaises(ValueError):
+                build_me31_ao_write_request("TRANSPARENT_SERIAL", 1, channel, value)
+
+    def test_rtu_parser_recognizes_fc16_acknowledgement(self):
+        parser = StreamFrames.create("TRANSPARENT_SERIAL")
+        ack = with_crc(bytes.fromhex("01 10 00 02 00 02"))
+        self.assertEqual(parser.push(ack[:3]), [])
+        self.assertEqual(parser.push(ack[3:]), [ack])
 
 
 if __name__ == "__main__":

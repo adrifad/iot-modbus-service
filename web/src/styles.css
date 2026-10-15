@@ -91,6 +91,16 @@ tr[data-clickable="true"]:hover td { background: color-mix(in srgb, var(--accent
 .button.danger { color: var(--critical); }
 .button.small { min-height: 28px; padding: 0 8px; font-size: 11px; }
 .button:disabled { opacity: .45; cursor: not-allowed; }
+.action-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.text-button { border: 0; padding: 0; color: var(--accent); background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.text-button:hover { text-decoration: underline; }
+.actions-menu { position: relative; }
+.actions-menu summary { list-style: none; cursor: pointer; }
+.actions-menu summary::-webkit-details-marker { display: none; }
+.actions-menu-list { position: absolute; z-index: 8; right: 0; top: calc(100% + 4px); display: grid; min-width: 168px; padding: 4px; border: 1px solid var(--line); background: var(--surface); box-shadow: 0 8px 22px rgb(15 23 42 / .1); }
+.actions-menu-list button { border: 0; padding: 9px 10px; background: transparent; color: var(--ink); text-align: left; font-size: 11px; cursor: pointer; }
+.actions-menu-list button:hover { background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.actions-menu-list .danger-text { color: var(--critical); }
 .icon-button { width: 34px; height: 34px; border: 1px solid var(--line); background: var(--surface); color: var(--muted); display: grid; place-items: center; border-radius: 5px; }
 .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-bottom: 14px; }
 .field { display: grid; gap: 6px; min-width: 0; }

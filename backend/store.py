@@ -117,6 +117,61 @@ class Store:
             self._ensure_column("gateways", "registration_token_hash", "TEXT")
             self._ensure_column("gateways", "identity_method", "TEXT NOT NULL DEFAULT 'MANUAL'")
             self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)", (utc_now(),))
+        if migration < 4:
+            for name, declaration in (
+                ("armed", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_source_value", "REAL"),
+                ("last_requested_value", "REAL"),
+                ("last_acknowledged_value", "REAL"),
+                ("last_success_at", "TEXT"),
+                ("last_attempt_at", "TEXT"),
+                ("last_error", "TEXT"),
+                ("failsafe_attempted", "INTEGER NOT NULL DEFAULT 0"),
+                ("created_at", "TEXT"),
+                ("updated_at", "TEXT"),
+            ):
+                self._ensure_column("mappings", name, declaration)
+            now = utc_now()
+            self.db.execute("UPDATE mappings SET created_at=COALESCE(created_at,?),updated_at=COALESCE(updated_at,?)", (now, now))
+            self.db.execute("UPDATE mappings SET armed=0,status=CASE WHEN enabled=1 THEN 'DISARMED' ELSE 'DISABLED' END")
+            # Only armed pipelines own physical outputs. Legacy configured
+            # mappings are disarmed on migration and can coexist safely.
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS mappings_active_destination ON mappings(destination_node_id,destination_channel) WHERE enabled=1 AND armed=1")
+            self.db.execute("CREATE INDEX IF NOT EXISTS mappings_source_lookup ON mappings(source_node_id,source_channel,enabled)")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)", (now,))
+        if migration < 5:
+            # Normalize only recognized ME31 nodes. Measurement rows, calibration
+            # revisions, and event history are deliberately left untouched.
+            compatible = self.db.execute("SELECT id,node_type,hardware_model FROM nodes").fetchall()
+            for node in compatible:
+                model = (node["hardware_model"] or "").strip().upper().replace("EBYTE ", "")
+                if node["node_type"] == "ANALOG_INPUT" and model in {"ME31-XAXX0600", "ME31-XAXX0600-V1.1"}:
+                    profile_id, hardware_model, prefix, channel_type = "ebyte-me31-xaxx0600-v1.1", "EBYTE ME31-XAXX0600", "AI", "ANALOG_INPUT"
+                elif node["node_type"] == "ANALOG_OUTPUT" and model in {"ME31-XXXA0006", "ME31-XXXA0006-V1.1"}:
+                    profile_id, hardware_model, prefix, channel_type = "ebyte-me31-xxxa0006-v1.1", "EBYTE ME31-XXXA0006", "AO", "ANALOG_OUTPUT"
+                else:
+                    continue
+                self.db.execute("UPDATE nodes SET hardware_model=?,profile_id=?,updated_at=? WHERE id=?", (hardware_model, profile_id, utc_now(), node["id"]))
+                for channel in range(1, 7):
+                    self.db.execute("INSERT OR IGNORE INTO channels(id,node_id,channel_index,channel_type,label,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                                    (f"{node['id']}:{prefix}{channel}", node["id"], channel, channel_type, f"{prefix}{channel}", utc_now(), utc_now()))
+                self.db.execute("DELETE FROM channels WHERE node_id=? AND channel_type=? AND (channel_index<1 OR channel_index>6)", (node["id"], channel_type))
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)", (utc_now(),))
+        if migration < 6:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS output_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, node_id TEXT NOT NULL,
+                channel INTEGER NOT NULL, source TEXT NOT NULL, target_ma REAL NOT NULL,
+                readback_ma REAL, result TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+                request_hex TEXT, response_hex TEXT
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS output_commands_node_time ON output_commands(node_id,channel,at DESC)")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)", (utc_now(),))
+        if migration < 7:
+            # Replace the original configuration-level reservation with actual
+            # runtime ownership. Disarmed pipelines do not control a device.
+            self.db.execute("DROP INDEX IF EXISTS mappings_active_destination")
+            self.db.execute("CREATE UNIQUE INDEX mappings_active_destination ON mappings(destination_node_id,destination_channel) WHERE enabled=1 AND armed=1")
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)", (utc_now(),))
         from .profiles import PROFILES
         for profile in PROFILES:
             self.db.execute("INSERT OR IGNORE INTO device_profiles(id,name,definition_json,created_at) VALUES(?,?,?,?)",

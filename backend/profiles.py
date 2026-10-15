@@ -72,6 +72,56 @@ ME31 = {
 
 PROFILES = [ME31]
 
+ME31_OUTPUT = {
+    "id": "ebyte-me31-xxxa0006-v1.1",
+    "name": "EBYTE ME31-XXXA0006",
+    "registers": [
+        {
+            "name": "AO output ranges",
+            "address": 0x0514,
+            "function_code": 3,
+            "quantity": 6,
+            "data_type": "enum16_array",
+            "values": {"0": "0–20 mA", "1": "4–20 mA"},
+            "category": "Analog Output Configuration",
+            "readable": True,
+            "writable": False,
+        },
+        {
+            "name": "AO setpoint readback",
+            "address": 0x0064,
+            "function_code": 3,
+            "quantity": 6,
+            "data_type": "uint16_array",
+            "unit": "mA",
+            "scale": 0.001,
+            "category": "Analog Output Measurements",
+            "readable": True,
+            "writable": False,
+            "description": "Reported setpoint in microampere; this is not a physical current measurement.",
+        },
+        *[
+            {
+                "name": f"AO{channel} setpoint command",
+                "address": (channel - 1) * 2,
+                "function_code": 16,
+                "quantity": 2,
+                "data_type": "float32",
+                "byte_order": "big",
+                "word_order": "BIG_WORD_FIRST",
+                "unit": "mA",
+                "category": "Analog Output Commands",
+                "readable": False,
+                "writable": True,
+                "restricted_action": True,
+            }
+            for channel in range(1, 7)
+        ],
+    ],
+}
+
+PROFILES.append(ME31_OUTPUT)
+
 def register(profile_id: str, name: str):
     profile = next((p for p in PROFILES if p["id"] == profile_id), None)
     if profile is None:

@@ -43,6 +43,60 @@ def build_request(mode: str, unit_id: int, function_code: int, address: int, qua
     return with_crc(bytes((unit_id,)) + pdu)
 
 
+def build_me31_ao_write_request(mode: str, unit_id: int, channel: int, value_ma: float, transaction_id: int = 1) -> bytes:
+    """Build the only supported write: one ME31 AO float setpoint via FC16."""
+    if mode not in {"MODBUS_TCP", "MODBUS_RTU", "TRANSPARENT_SERIAL"}:
+        raise ValueError("unsupported gateway transport mode")
+    if unit_id not in range(1, 248):
+        raise ValueError("Modbus slave ID must be 1–247")
+    if channel not in range(1, 7):
+        raise ValueError("ME31 output channel must be AO1–AO6")
+    try:
+        value = float(value_ma)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("output current must be a finite number") from exc
+    if not math.isfinite(value) or not 0 <= value <= 25:
+        raise ValueError("output current must be finite and within the ME31 0–25 mA register range")
+    address = (channel - 1) * 2
+    registers = struct.pack(">f", value)
+    pdu = bytes((16, address >> 8, address & 0xFF, 0, 2, 4)) + registers
+    if mode == "MODBUS_TCP":
+        return transaction_id.to_bytes(2, "big") + b"\x00\x00" + (len(pdu) + 1).to_bytes(2, "big") + bytes((unit_id,)) + pdu
+    return with_crc(bytes((unit_id,)) + pdu)
+
+
+def decode_write_ack(mode: str, frame: bytes, *, unit_id: int, address: int, quantity: int = 2, transaction_id: int | None = None) -> None:
+    """Validate an FC16 acknowledgement, including the echoed address/count."""
+    if mode == "MODBUS_TCP":
+        if len(frame) < 9:
+            raise ModbusError("truncated Modbus TCP FC16 acknowledgement")
+        if transaction_id is not None and int.from_bytes(frame[:2], "big") != transaction_id:
+            raise ModbusError("transaction identifier mismatch")
+        if frame[2:4] != b"\x00\x00" or int.from_bytes(frame[4:6], "big") != len(frame) - 6:
+            raise ModbusError("invalid Modbus TCP FC16 acknowledgement header")
+        if frame[6] != unit_id:
+            raise ModbusError("unit identifier mismatch")
+        function, body = frame[7], frame[8:]
+    else:
+        if len(frame) < 5:
+            raise ModbusError("truncated RTU FC16 acknowledgement")
+        if frame[0] != unit_id:
+            raise ModbusError("slave identifier mismatch")
+        if crc16(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+            raise ModbusError("RTU CRC mismatch")
+        function, body = frame[1], frame[2:-2]
+    if function == 0x90:
+        if len(body) != 1:
+            raise ModbusError("invalid Modbus exception response length")
+        raise ModbusExceptionResponse(16, body[0])
+    if function != 16:
+        raise ModbusError(f"function code mismatch: expected 16, received {function}")
+    if (mode == "MODBUS_TCP" and len(frame) != 12) or (mode != "MODBUS_TCP" and len(frame) != 8):
+        raise ModbusError("invalid FC16 acknowledgement length")
+    if len(body) != 4 or int.from_bytes(body[:2], "big") != address or int.from_bytes(body[2:], "big") != quantity:
+        raise ModbusError("FC16 acknowledgement address or quantity mismatch")
+
+
 def expected_response_length(mode: str, buffer: bytes) -> int | None:
     if mode == "MODBUS_TCP":
         if len(buffer) < 7:
@@ -179,7 +233,7 @@ class StreamFrames:
                     self.errors.append("discarded RTU byte outside slave address range")
                     continue
                 function = self.buffer[1]
-                if function in (0x83, 0x84):
+                if function in (0x83, 0x84, 0x90):
                     total = 5
                 elif function in (3, 4):
                     if len(self.buffer) < 3:
@@ -190,6 +244,8 @@ class StreamFrames:
                         self.errors.append("invalid RTU register byte count; resynchronizing")
                         continue
                     total = 5 + byte_count
+                elif function == 16:
+                    total = 8
                 else:
                     del self.buffer[0]
                     self.errors.append(f"unexpected RTU function code {function}; resynchronizing")
@@ -203,7 +259,7 @@ class StreamFrames:
                     if self.buffer[offset] not in range(1, 248):
                         continue
                     function = self.buffer[offset + 1]
-                    if function in (0x83, 0x84):
+                    if function in (0x83, 0x84, 0x90):
                         candidate_length = 5
                     elif function in (3, 4) and offset + 3 <= len(self.buffer):
                         byte_count = self.buffer[offset + 2]

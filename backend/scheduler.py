@@ -198,8 +198,9 @@ class PollScheduler:
             with self.store.transaction() as db:
                 db.execute("UPDATE gateways SET last_activity_at=? WHERE id=?", (now, first["gateway_id"]))
                 for item, value_json, measurements in processed:
-                    db.execute("UPDATE polling_items SET last_value=?,last_success_at=?,last_latency_ms=?,last_status='GOOD',updated_at=? WHERE id=?",
-                               (value_json, now, latency, now, item["id"]))
+                    item_status = "MEASUREMENT_ERROR" if measurements is None else "GOOD"
+                    db.execute("UPDATE polling_items SET last_value=?,last_success_at=?,last_latency_ms=?,last_status=?,error_count=error_count+?,updated_at=? WHERE id=?",
+                               (value_json, now, latency, item_status, int(measurements is None), now, item["id"]))
                     if measurements:
                         db.executemany("""INSERT INTO measurements(node_id,channel,register_value,raw_registers_json,raw_ma,calibration_revision,calibrated_ma,engineering_value,engineering_unit,quality,measured_at)
                             VALUES(?,?,?,?,?,?,?,?,?,?,?)""", measurements)
@@ -210,6 +211,7 @@ class PollScheduler:
                 self.failed += 1
                 self.store.event("DECODE_ERROR",detail,gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=item["function_code"],address=item["address"],quantity=item["quantity"],latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
             for item, detail in measurement_errors:
+                self.failed += 1
                 self.store.event("MEASUREMENT_PROCESSING_ERROR",detail,gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=item["function_code"],address=item["address"],quantity=item["quantity"],latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
             return
         except asyncio.CancelledError:

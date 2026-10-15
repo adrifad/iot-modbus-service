@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from .gateway import GatewaySession
 from .modbus import decode_registers
+from .output import OutputDriver, OutputError
+from .pipelines import PipelineError, PipelineService
 from .profiles import PROFILES, register
 from .scheduler import PollScheduler
 from .store import Store, utc_now
@@ -50,6 +52,7 @@ class SessionRegistry:
                 self.by_gateway.pop(gateway["id"], None)
                 await previous.retire()
                 self.store.event("SESSION_REPLACED", "Gateway session explicitly replaced during commissioning", gateway_id=gateway["id"],protocol=previous.transport_mode)
+                _disarm_pipelines_for_gateway(gateway["id"], "Gateway session replaced; operator re-arm is required", self.store)
             await session.commission(gateway["id"], gateway["transport_mode"])
             self.by_gateway[gateway["id"]] = session.session_id
             old_connected = gateway.get("last_connected_at") is not None
@@ -76,7 +79,22 @@ class SessionRegistry:
 store = Store()
 sessions = SessionRegistry(store)
 scheduler = PollScheduler(store, sessions)
+output_driver = OutputDriver(store, sessions)
+pipelines = PipelineService(store, sessions, output_driver)
 tcp_server = None
+
+
+def _disarm_pipelines_for_gateway(gateway_id, reason, target_store=None):
+    target_store = target_store or store
+    affected = target_store.rows("""SELECT p.id,p.name,s.gateway_id AS source_gateway,d.gateway_id AS destination_gateway
+        FROM mappings p JOIN nodes s ON s.id=p.source_node_id JOIN nodes d ON d.id=p.destination_node_id
+        WHERE p.enabled=1 AND p.armed=1 AND (s.gateway_id=? OR d.gateway_id=?)""", (gateway_id,gateway_id))
+    for pipeline in affected:
+        status = "OUTPUT_DISCONNECTED" if pipeline["destination_gateway"] == gateway_id else "SOURCE_DISCONNECTED"
+        detail = f"{reason}; pipeline remains configured but disarmed"
+        target_store.run("UPDATE mappings SET armed=0,status=?,last_error=?,updated_at=? WHERE id=?", (status,detail,utc_now(),pipeline["id"]))
+        target_store.audit("AUTO_DISARM", "pipeline", pipeline["id"], {"gateway_id":gateway_id,"status":status,"reason":reason})
+        pipelines._next_due.pop(pipeline["id"], None)
 
 
 async def on_disconnect(session, error=None):
@@ -85,6 +103,7 @@ async def on_disconnect(session, error=None):
             sessions.by_gateway.pop(session.gateway_id, None)
             store.run("UPDATE gateways SET last_disconnected_at=?,connection_errors=connection_errors+? WHERE id=?", (utc_now(),int(error is not None),session.gateway_id))
             store.event("SESSION_DESYNCHRONIZED" if session.desynchronized else "DISCONNECTED", error or "Gateway TCP session closed", gateway_id=session.gateway_id, protocol=session.transport_mode)
+            _disarm_pipelines_for_gateway(session.gateway_id, error or "Gateway TCP session closed")
     elif session.state != "RETIRED":
         store.event("PENDING_DISCONNECTED", "Uncommissioned TCP session closed", protocol="TCP")
 
@@ -140,7 +159,7 @@ def _item_health(item, now=None):
     if not item["enabled"]:
         return "DISABLED"
     if not item.get("last_success_at"):
-        return item["last_status"] if item["last_status"] in {"TIMEOUT","MODBUS_ERROR","INVALID_RESPONSE","DECODE_ERROR","DISCONNECTED"} else "UNKNOWN"
+        return item["last_status"] if item["last_status"] in {"TIMEOUT","MODBUS_ERROR","INVALID_RESPONSE","DECODE_ERROR","MEASUREMENT_ERROR","DISCONNECTED"} else "UNKNOWN"
     try:
         last = datetime.fromisoformat(item["last_success_at"])
     except (TypeError, ValueError):
@@ -156,7 +175,27 @@ def _item_health(item, now=None):
 
 def _node_modbus_health(node, items, gateway_connected):
     if node["node_type"] == "ANALOG_OUTPUT":
-        return "UNKNOWN"
+        if not node.get("gateway_id"):
+            return "UNKNOWN"
+        if not gateway_connected:
+            return "DISCONNECTED"
+        if not node.get("polling_enabled"):
+            return "DISABLED"
+        if not node.get("id"):
+            return "UNKNOWN"
+        recent=store.one("SELECT at,result FROM events WHERE node_id=? AND result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED','OUTPUT_READ_FAILED','OUTPUT_WRITE_FAILED','OUTPUT_READBACK_FAILED') ORDER BY id DESC LIMIT 1",(node["id"],))
+        if not recent:
+            return "UNKNOWN"
+        if recent["result"] in {"OUTPUT_READ_FAILED","OUTPUT_WRITE_FAILED","OUTPUT_READBACK_FAILED"}:
+            return "MODBUS_ERROR"
+        try:
+            timestamp=datetime.fromisoformat(recent["at"])
+            if timestamp.tzinfo is None: timestamp=timestamp.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc)-timestamp).total_seconds()>int(os.getenv("OUTPUT_STATUS_FRESHNESS_SECONDS","120")):
+                return "STALE"
+        except (TypeError,ValueError):
+            return "UNKNOWN"
+        return "RESPONDING"
     if not gateway_connected:
         return "DISCONNECTED" if node.get("gateway_id") else "UNKNOWN"
     if not node.get("polling_enabled"):
@@ -165,7 +204,7 @@ def _node_modbus_health(node, items, gateway_connected):
     if not enabled:
         return "DISABLED"
     states = [_item_health(item) for item in enabled]
-    for state in ("MODBUS_ERROR","INVALID_RESPONSE","DECODE_ERROR","POLL_ERROR","TIMEOUT","DISCONNECTED"):
+    for state in ("MODBUS_ERROR","INVALID_RESPONSE","DECODE_ERROR","MEASUREMENT_ERROR","POLL_ERROR","TIMEOUT","DISCONNECTED"):
         if state in states:
             return state
     if "STALE" in states:
@@ -258,7 +297,9 @@ async def lifespan(app: FastAPI):
         ssl_context.load_cert_chain(cert_file, key_file)
     tcp_server = await asyncio.start_server(on_tcp_client, host, port, limit=65536, ssl=ssl_context)
     scheduler.start()
+    pipelines.start()
     yield
+    await pipelines.stop()
     await scheduler.stop()
     tcp_server.close()
     await tcp_server.wait_closed()
@@ -322,6 +363,46 @@ class NodeCreate(BaseModel):
     def valid_node_type(cls, value):
         if value not in {"ANALOG_INPUT", "ANALOG_OUTPUT"}:
             raise ValueError("node_type must be ANALOG_INPUT or ANALOG_OUTPUT")
+        return value
+
+
+class PipelineCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    source_node_id: str = Field(min_length=1, max_length=100)
+    source_channel: int = Field(ge=1, le=6)
+    destination_node_id: str = Field(min_length=1, max_length=100)
+    destination_channel: int = Field(ge=1, le=6)
+    source_value_type: str
+    config: dict = Field(default_factory=dict)
+
+    @field_validator("source_value_type")
+    @classmethod
+    def valid_source_value_type(cls, value):
+        if value not in {"RAW_MA", "CALIBRATED_MA", "ENGINEERING"}:
+            raise ValueError("source value must be RAW_MA, CALIBRATED_MA, or ENGINEERING")
+        return value
+
+
+class PipelineConfirm(BaseModel):
+    confirm: bool = False
+
+
+class OutputSetpointInput(BaseModel):
+    target_ma: float
+    confirm: bool = False
+
+    @field_validator("target_ma", mode="before")
+    @classmethod
+    def reject_boolean_target(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("target current must be a number, not a boolean")
+        return value
+
+    @field_validator("target_ma")
+    @classmethod
+    def finite_target(cls, value):
+        if not math.isfinite(value):
+            raise ValueError("target current must be finite")
         return value
 
 
@@ -455,6 +536,7 @@ async def overview(_: str = Depends(authorize)):
     node_summary = []
     for node in nodes:
         last = store.one("SELECT MAX(measured_at) at FROM measurements WHERE node_id=?", (node["id"],))
+        last_modbus=store.one("SELECT MAX(at) at FROM events WHERE node_id=? AND result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED')",(node["id"],)) if node["node_type"]=="ANALOG_OUTPUT" else {"at":None}
         item_count = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1", (node["id"],))["count"]
         items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node["id"],))
         gateway_connected=node["gateway_id"] in connected_gateway_ids
@@ -465,13 +547,23 @@ async def overview(_: str = Depends(authorize)):
         else: bucket["health_unknown"]+=1
         node_summary.append({**node,"gateway_state":"CONNECTED" if gateway_connected else "DISCONNECTED" if node["gateway_id"] else "UNKNOWN",
                              "gateway_connected":gateway_connected,"modbus_health":health_state,"modbus_healthy":health_state=="RESPONDING",
-                             "last_measurement_at":last["at"],"enabled_channel_count":item_count})
+                             "last_measurement_at":last["at"],"last_modbus_at":last_modbus["at"],"enabled_channel_count":item_count})
     return {"inputs":counts["analog_input"],"outputs":counts["analog_output"],"gateway_connections":{"total":len(gateways),"connected":len(connected_gateway_ids)},"polling":{"active":item_stats.get("active") or 0,"successful":event_stats.get("successful") or 0,"failed":event_stats.get("failed") or 0,"average_response_ms":event_stats.get("avg_latency_ms"),"state":"RUNNING" if scheduler.running else "STOPPED"},"last_measurement_at":latest["at"] if latest else None,"nodes":node_summary,"recent_events":store.rows("SELECT * FROM events ORDER BY id DESC LIMIT 8")}
 
 
 @app.get("/api/gateways")
 async def list_gateways(_: str = Depends(authorize)):
-    return store.rows("SELECT * FROM gateways ORDER BY name")
+    result=[]
+    for row in store.rows("SELECT * FROM gateways ORDER BY name"):
+        public=_gateway_public(row)
+        diagnostic=store.one("SELECT at,result,detail FROM events WHERE gateway_id=? ORDER BY id DESC LIMIT 1",(row["id"],))
+        public["last_diagnostic"]=diagnostic
+        result.append(public)
+    return result
+
+
+def _gateway_public(row):
+    return {key:value for key,value in row.items() if key != "registration_token_hash"}
 
 
 @app.post("/api/gateways", status_code=201)
@@ -482,7 +574,7 @@ async def create_gateway(data: GatewayCreate, actor=Depends(authorize)):
     except Exception as exc:
         raise HTTPException(409, "Gateway ID already exists or configuration is invalid") from exc
     store.audit("CREATE","gateway",gateway_id,data.model_dump(),actor)
-    return store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
+    return _gateway_public(store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,)))
 
 
 @app.post("/api/gateways/{gateway_id}/registration-token")
@@ -506,12 +598,67 @@ async def patch_gateway(gateway_id: str, data: GatewayPatch, actor=Depends(autho
     existing=store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,))
     if not existing: raise HTTPException(404,"Gateway not found")
     changes=data.model_dump(exclude_unset=True)
-    if "transport_mode" in changes and changes["transport_mode"] != existing["transport_mode"] and sessions.for_gateway(gateway_id):
-        raise HTTPException(409,"Disconnect the commissioned session before changing transport framing")
+    if "transport_mode" in changes and changes["transport_mode"] != existing["transport_mode"]:
+        if sessions.for_gateway(gateway_id):
+            raise HTTPException(409,"Disconnect the commissioned session before changing transport framing")
+        assigned = store.rows("SELECT id,node_type FROM nodes WHERE gateway_id=?", (gateway_id,))
+        expected = {"ANALOG_INPUT": "MODBUS_TCP", "ANALOG_OUTPUT": "TRANSPARENT_SERIAL"}
+        incompatible = [node["id"] for node in assigned if expected.get(node["node_type"]) != changes["transport_mode"]]
+        if incompatible:
+            raise HTTPException(409,"Transport cannot change while assigned ME31 nodes require the current framing; reassign those nodes first")
+        dependent = store.one("SELECT COUNT(*) count FROM mappings p JOIN nodes s ON s.id=p.source_node_id JOIN nodes d ON d.id=p.destination_node_id WHERE p.enabled=1 AND (s.gateway_id=? OR d.gateway_id=?)", (gateway_id,gateway_id))
+        if dependent and dependent["count"]:
+            raise HTTPException(409,"Disable dependent pipelines before changing gateway transport")
     if changes:
         store.run(f"UPDATE gateways SET {','.join(key+'=?' for key in changes)},updated_at=? WHERE id=?",(*changes.values(),utc_now(),gateway_id))
         store.audit("UPDATE","gateway",gateway_id,changes,actor)
-    return store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,))
+    return _gateway_public(store.one("SELECT * FROM gateways WHERE id=?",(gateway_id,)))
+
+
+@app.post("/api/gateways/{gateway_id}/disconnect")
+async def disconnect_gateway(gateway_id: str, actor=Depends(authorize)):
+    gateway = store.one("SELECT id FROM gateways WHERE id=?", (gateway_id,))
+    if not gateway:
+        raise HTTPException(404, "Gateway not found")
+    session = sessions.for_gateway(gateway_id)
+    if not session:
+        raise HTTPException(409, "Gateway has no active commissioned session")
+    async with sessions.lock:
+        if sessions.by_gateway.get(gateway_id) == session.session_id:
+            sessions.by_gateway.pop(gateway_id, None)
+        await session.retire()
+        store.run("UPDATE gateways SET last_disconnected_at=?,updated_at=? WHERE id=?", (utc_now(),utc_now(),gateway_id))
+        _disarm_pipelines_for_gateway(gateway_id, "Gateway intentionally disconnected by an administrator")
+    store.event("OPERATOR_DISCONNECT", "Gateway session intentionally disconnected by an administrator", gateway_id=gateway_id, protocol=session.transport_mode)
+    store.audit("DISCONNECT_SESSION", "gateway", gateway_id, {"session_id": session.session_id}, actor)
+    return {"gateway_id": gateway_id, "session_id": session.session_id, "state": "DISCONNECTED"}
+
+
+@app.delete("/api/gateways/{gateway_id}", status_code=204)
+async def delete_gateway(gateway_id: str, actor=Depends(authorize)):
+    gateway = store.one("SELECT * FROM gateways WHERE id=?", (gateway_id,))
+    if not gateway:
+        raise HTTPException(404, "Gateway not found")
+    nodes = store.rows("SELECT id,name,node_type FROM nodes WHERE gateway_id=? ORDER BY name", (gateway_id,))
+    pipelines_for_gateway = store.rows("""SELECT DISTINCT p.id,p.name,p.enabled,p.armed FROM mappings p
+        JOIN nodes s ON s.id=p.source_node_id OR s.id=p.destination_node_id
+        WHERE s.gateway_id=? ORDER BY p.name""", (gateway_id,))
+    active = [pipeline for pipeline in pipelines_for_gateway if pipeline["enabled"] or pipeline["armed"]]
+    if nodes or active:
+        node_names = ", ".join(node["name"] for node in nodes) or "none"
+        pipeline_names = ", ".join(pipeline["name"] for pipeline in pipelines_for_gateway) or "none"
+        raise HTTPException(409, f"Gateway has dependent nodes ({node_names}) and pipelines ({pipeline_names}). Disable/delete affected pipelines, then reassign or remove the nodes before deleting this gateway.")
+    session = sessions.for_gateway(gateway_id)
+    if session:
+        async with sessions.lock:
+            sessions.by_gateway.pop(gateway_id, None)
+            await session.retire()
+    with store.transaction() as db:
+        # Communication and audit history intentionally have no cascading FK.
+        db.execute("DELETE FROM gateways WHERE id=?", (gateway_id,))
+        db.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,detail_json) VALUES(?,?,?,?,?,?)",
+                   (utc_now(),actor,"DELETE","gateway",gateway_id,json.dumps({"name":gateway["name"],"registration_revoked":True},sort_keys=True)))
+    store.event("GATEWAY_DELETED", f"Gateway {gateway['name']} deleted; registration credentials revoked", gateway_id=gateway_id)
 
 
 @app.get("/api/gateways/sessions")
@@ -542,6 +689,8 @@ async def list_nodes(type: str | None = Query(default=None), search: str | None 
         node["enabled_channel_count"] = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1",(node["id"],))["count"]
         latest=store.one("SELECT MAX(measured_at) at FROM measurements WHERE node_id=?",(node["id"],))
         node["last_measurement_at"]=latest["at"]
+        last_modbus=store.one("SELECT MAX(at) at FROM events WHERE node_id=? AND result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED')",(node["id"],)) if node["node_type"]=="ANALOG_OUTPUT" else {"at":None}
+        node["last_modbus_at"]=last_modbus["at"]
         node["gateway_connected"]=node["gateway_id"] in connected
         node["gateway_state"]="CONNECTED" if node["gateway_connected"] else "DISCONNECTED" if node["gateway_id"] else "UNKNOWN"
         node["modbus_health"]=_node_modbus_health(node,store.rows("SELECT * FROM polling_items WHERE node_id=?",(node["id"],)),node["gateway_connected"])
@@ -555,17 +704,31 @@ async def list_nodes(type: str | None = Query(default=None), search: str | None 
 
 @app.post("/api/nodes", status_code=201)
 async def create_node(data: NodeCreate, actor=Depends(authorize)):
-    if data.profile_id and not any(profile["id"] == data.profile_id for profile in PROFILES):
-        raise HTTPException(422,"Device profile does not exist")
-    if data.gateway_id and not store.one("SELECT id FROM gateways WHERE id=?",(data.gateway_id,)):
+    profile_id, hardware_model, expected_transport = (
+        ("ebyte-me31-xaxx0600-v1.1", "EBYTE ME31-XAXX0600", "MODBUS_TCP")
+        if data.node_type == "ANALOG_INPUT" else
+        ("ebyte-me31-xxxa0006-v1.1", "EBYTE ME31-XXXA0006", "TRANSPARENT_SERIAL")
+    )
+    if data.profile_id not in (None, profile_id):
+        raise HTTPException(422,"Node type is fixed to its corresponding ME31 device profile")
+    if data.hardware_model and data.hardware_model.strip().upper().replace("EBYTE ", "") != hardware_model.removeprefix("EBYTE "):
+        raise HTTPException(422,"Hardware model is fixed by the selected ME31 node type")
+    gateway = store.one("SELECT id,transport_mode FROM gateways WHERE id=?",(data.gateway_id,)) if data.gateway_id else None
+    if data.gateway_id and not gateway:
         raise HTTPException(422,"Assigned gateway does not exist")
+    if gateway and gateway["transport_mode"] != expected_transport:
+        raise HTTPException(422,f"{hardware_model} requires a {expected_transport} gateway")
     node_id, now = data.id or str(uuid4()), utc_now()
-    store.run("INSERT INTO nodes(id,name,node_type,hardware_model,gateway_id,slave_id,profile_id,polling_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(node_id,data.name,data.node_type,data.hardware_model,data.gateway_id,data.slave_id,data.profile_id,int(data.polling_enabled),now,now))
-    if data.node_type == "ANALOG_INPUT":
-        for channel in range(1,7):
-            store.run("INSERT INTO channels(id,node_id,channel_index,channel_type,label,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                      (str(uuid4()),node_id,channel,"ANALOG_INPUT",f"AI{channel}",now,now))
-    store.audit("CREATE","node",node_id,data.model_dump(),actor)
+    try:
+        with store.transaction() as db:
+            db.execute("INSERT INTO nodes(id,name,node_type,hardware_model,gateway_id,slave_id,profile_id,polling_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(node_id,data.name,data.node_type,hardware_model,data.gateway_id,data.slave_id,profile_id,int(data.polling_enabled),now,now))
+            prefix, channel_type = ("AI","ANALOG_INPUT") if data.node_type == "ANALOG_INPUT" else ("AO","ANALOG_OUTPUT")
+            for channel in range(1,7):
+                db.execute("INSERT INTO channels(id,node_id,channel_index,channel_type,label,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (str(uuid4()),node_id,channel,channel_type,f"{prefix}{channel}",now,now))
+    except Exception as exc:
+        raise HTTPException(409,"Node ID already exists or configuration conflicts with the fixed six-channel ME31 profile") from exc
+    store.audit("CREATE","node",node_id,{**data.model_dump(),"hardware_model":hardware_model,"profile_id":profile_id},actor)
     return store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
 
 
@@ -591,12 +754,7 @@ async def create_output_channel(node_id: str, data: ChannelCreate, actor=Depends
     node=store.one("SELECT id,node_type FROM nodes WHERE id=?",(node_id,))
     if not node: raise HTTPException(404,"Node not found")
     if node["node_type"]!="ANALOG_OUTPUT": raise HTTPException(422,"Input channels are defined by the input device profile")
-    now=utc_now();channel_id=str(uuid4())
-    try:
-        store.run("INSERT INTO channels(id,node_id,channel_index,channel_type,label,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(channel_id,node_id,data.channel_index,"ANALOG_OUTPUT",data.label,now,now))
-    except Exception as exc: raise HTTPException(409,"Output channel index is already configured") from exc
-    store.audit("CREATE","channel",channel_id,data.model_dump(),actor)
-    return store.one("SELECT * FROM channels WHERE id=?",(channel_id,))
+    raise HTTPException(409,"ME31-XXXA0006 nodes always contain six provisioned AO channels; edit an existing channel label instead")
 
 
 @app.patch("/api/channels/{channel_id}")
@@ -607,6 +765,9 @@ async def patch_channel(channel_id: str, changes: dict, actor=Depends(authorize)
     if "label" in changes and (not isinstance(changes["label"],str) or not changes["label"].strip() or len(changes["label"])>80): raise HTTPException(422,"Channel label must be 1–80 characters")
     if "config" in changes and not isinstance(changes["config"],dict): raise HTTPException(422,"Channel config must be an object")
     if "enabled" in changes and not isinstance(changes["enabled"],bool): raise HTTPException(422,"Channel enabled state must be boolean")
+    if changes.get("enabled") is False:
+        refs=store.one("SELECT COUNT(*) count FROM mappings WHERE enabled=1 AND ((source_node_id=? AND source_channel=?) OR (destination_node_id=? AND destination_channel=?))",(channel["node_id"],channel["channel_index"],channel["node_id"],channel["channel_index"]))
+        if refs and refs["count"]: raise HTTPException(409,"Disable dependent pipelines before disabling this channel")
     sets=[];values=[]
     if "label" in changes: sets.append("label=?");values.append(changes["label"].strip())
     if "enabled" in changes: sets.append("enabled=?");values.append(int(bool(changes["enabled"])))
@@ -631,15 +792,28 @@ async def patch_node(node_id: str, changes: dict, actor=Depends(authorize)):
         raise HTTPException(422,"Hardware model must be 100 characters or fewer")
     if "gateway_id" in changes and changes["gateway_id"] is not None and not isinstance(changes["gateway_id"],str):
         raise HTTPException(422,"Gateway ID must be text or null")
-    if "profile_id" in changes and changes["profile_id"] is not None and changes["profile_id"] not in [profile["id"] for profile in PROFILES]:
-        raise HTTPException(422,"Device profile does not exist")
+    fixed_profile, fixed_model, expected_transport = ("ebyte-me31-xaxx0600-v1.1","EBYTE ME31-XAXX0600","MODBUS_TCP") if existing["node_type"]=="ANALOG_INPUT" else ("ebyte-me31-xxxa0006-v1.1","EBYTE ME31-XXXA0006","TRANSPARENT_SERIAL")
+    if "profile_id" in changes and changes["profile_id"] != fixed_profile:
+        raise HTTPException(422,"ME31 device profile cannot be changed")
+    if "hardware_model" in changes and changes["hardware_model"].strip().upper().replace("EBYTE ", "") != fixed_model.removeprefix("EBYTE "):
+        raise HTTPException(422,"ME31 hardware model cannot be changed")
     if "polling_enabled" in changes and not isinstance(changes["polling_enabled"],bool):
         raise HTTPException(422,"polling_enabled must be boolean")
     if "gateway_id" in changes and changes["gateway_id"] and not store.one("SELECT id FROM gateways WHERE id=?",(changes["gateway_id"],)):
         raise HTTPException(422,"Assigned gateway does not exist")
+    if "gateway_id" in changes and changes["gateway_id"]:
+        assigned = store.one("SELECT transport_mode FROM gateways WHERE id=?",(changes["gateway_id"],))
+        if assigned["transport_mode"] != expected_transport:
+            raise HTTPException(422,f"This ME31 model requires a {expected_transport} gateway")
     if "slave_id" in changes and (not isinstance(changes["slave_id"],int) or isinstance(changes["slave_id"],bool) or not 1 <= changes["slave_id"] <= 247):
         raise HTTPException(422,"Slave ID must be 1–247")
+    if set(changes) & {"gateway_id","polling_enabled"}:
+        dependencies=store.one("SELECT COUNT(*) count FROM mappings WHERE enabled=1 AND (source_node_id=? OR destination_node_id=?)",(node_id,node_id))
+        if dependencies and dependencies["count"]:
+            raise HTTPException(409,"Disable dependent pipelines before reassigning or disabling this node")
     normalized = {key:(int(value) if key=="polling_enabled" else value.strip() if key in {"name","hardware_model"} and isinstance(value,str) else value) for key,value in changes.items()}
+    normalized["profile_id"] = fixed_profile
+    normalized["hardware_model"] = fixed_model
     if normalized:
         store.run(f"UPDATE nodes SET {','.join(key+'=?' for key in normalized)},updated_at=? WHERE id=?",(*normalized.values(),utc_now(),node_id))
         store.audit("UPDATE","node",node_id,changes,actor)
@@ -698,6 +872,8 @@ async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authoriz
     if node["node_type"] != "ANALOG_INPUT":
         raise HTTPException(422,"Output-node polling requires a verified device profile")
     if data.profile_id:
+        if data.profile_id != node["profile_id"]:
+            raise HTTPException(422,"Polling profile must match the node's fixed ME31 hardware profile")
         definition=register(data.profile_id,data.register_name)
         if not definition or not definition.get("readable") or definition.get("restricted_action"):
             raise HTTPException(422,"Register profile entry is unavailable for polling")
@@ -736,6 +912,7 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
     if "word_order" in changes and changes["word_order"] not in {"BIG_WORD_FIRST","LITTLE_WORD_FIRST","unverified"}: raise HTTPException(422,"Unsupported word order")
     if ("byte_order" in changes or "word_order" in changes) and item["data_type"].startswith("float"):
         changes["float_verified"] = False
+        changes["enabled"] = False
     if changes.get("enabled") and item["data_type"].startswith("float"):
         if changes.get("word_order",item["word_order"]) == "unverified" or not item["float_verified"]:
             raise HTTPException(422,"Verify float byte and word order against a known reference before enabling polling")
@@ -914,16 +1091,143 @@ async def logs(limit: int = Query(default=100,ge=1,le=1000), offset: int = Query
     return store.rows("SELECT * FROM events ORDER BY id DESC LIMIT ? OFFSET ?",(limit,offset))
 
 
+@app.get("/api/nodes/{node_id}/outputs")
+async def output_state(node_id: str, _: str = Depends(authorize)):
+    node=store.one("SELECT * FROM nodes WHERE id=?",(node_id,))
+    if not node: raise HTTPException(404,"Output node not found")
+    if node["node_type"]!="ANALOG_OUTPUT": raise HTTPException(422,"Node is not an analog output")
+    try:
+        state=await output_driver.inspect(node_id)
+    except OutputError as exc:
+        raise HTTPException(422,str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503,f"Output read failed: {exc}") from exc
+    for channel in state["channels"]:
+        recent=store.one("SELECT * FROM output_commands WHERE node_id=? AND channel=? ORDER BY id DESC LIMIT 1",(node_id,channel["channel"]))
+        channel["last_write"] = recent
+        channel["active_pipeline"] = store.one("SELECT id,name,status FROM mappings WHERE destination_node_id=? AND destination_channel=? AND enabled=1 AND armed=1",(node_id,channel["channel"]))
+    return state
+
+
+@app.post("/api/nodes/{node_id}/outputs/{channel}/set")
+async def manual_output_set(node_id: str, channel: int, data: OutputSetpointInput, actor=Depends(authorize)):
+    if not data.confirm:
+        raise HTTPException(422,"Confirm the physical output test before sending an AO command")
+    try:
+        result=await output_driver.set_output(node_id,channel,data.target_ma,source=f"MANUAL:{actor}")
+    except OutputError as exc:
+        code=409 if "locked" in str(exc).lower() or "active pipeline" in str(exc).lower() else 422
+        raise HTTPException(code,str(exc)) from exc
+    except (ConnectionError,TimeoutError) as exc:
+        raise HTTPException(503,str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502,f"AO command did not complete and read back successfully: {exc}") from exc
+    store.audit("MANUAL_OUTPUT_SET","node",node_id,{"channel":channel,"target_ma":data.target_ma,"acknowledged_ma":result["acknowledged_ma"],"operator_confirmation":True},actor)
+    return result
+
+
+@app.get("/api/pipelines")
+async def list_pipelines(_: str = Depends(authorize)):
+    return pipelines.list()
+
+
+@app.post("/api/pipelines",status_code=201)
+async def create_pipeline(data: PipelineCreate, actor=Depends(authorize)):
+    try:
+        result=pipelines.create(data.model_dump())
+    except PipelineError as exc:
+        raise HTTPException(422,str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409,f"Pipeline could not be saved: {exc}") from exc
+    store.audit("CREATE_PIPELINE","pipeline",result["id"],{"initial_state":"DISABLED_DISARMED"},actor)
+    return result
+
+
+@app.get("/api/pipelines/{pipeline_id}")
+async def get_pipeline(pipeline_id: str, _: str = Depends(authorize)):
+    result=pipelines.get(pipeline_id)
+    if not result: raise HTTPException(404,"Pipeline not found")
+    return result
+
+
+@app.patch("/api/pipelines/{pipeline_id}")
+async def patch_pipeline(pipeline_id: str, changes: dict, actor=Depends(authorize)):
+    allowed={"name","source_node_id","source_channel","destination_node_id","destination_channel","source_value_type","config"}
+    if set(changes)-allowed: raise HTTPException(422,"Only pipeline definition fields can be edited")
+    try:
+        result=pipelines.update(pipeline_id,changes)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+    except PipelineError as exc: raise HTTPException(409,str(exc)) from exc
+    except Exception as exc: raise HTTPException(422,f"Pipeline configuration is invalid: {exc}") from exc
+    store.audit("UPDATE_PIPELINE","pipeline",pipeline_id,changes,actor)
+    return result
+
+
+@app.delete("/api/pipelines/{pipeline_id}",status_code=204)
+async def delete_pipeline(pipeline_id: str, actor=Depends(authorize)):
+    try: await pipelines.delete(pipeline_id)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+    except PipelineError as exc: raise HTTPException(409,str(exc)) from exc
+    store.audit("DELETE_PIPELINE","pipeline",pipeline_id,{},actor)
+
+
+@app.post("/api/pipelines/{pipeline_id}/enable")
+async def enable_pipeline(pipeline_id: str, data: PipelineConfirm, actor=Depends(authorize)):
+    try: result=await pipelines.enable(pipeline_id,data.confirm)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+    except PipelineError as exc: raise HTTPException(409,str(exc)) from exc
+    store.audit("ENABLE_PIPELINE","pipeline",pipeline_id,{"confirmed":data.confirm},actor)
+    return result
+
+
+@app.post("/api/pipelines/{pipeline_id}/disable")
+async def disable_pipeline(pipeline_id: str, actor=Depends(authorize)):
+    try: result=await pipelines.disarm(pipeline_id,disable=True)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+    store.audit("DISABLE_PIPELINE","pipeline",pipeline_id,{},actor)
+    return result
+
+
+@app.post("/api/pipelines/{pipeline_id}/arm")
+async def arm_pipeline(pipeline_id: str, data: PipelineConfirm, actor=Depends(authorize)):
+    try: result=await pipelines.arm(pipeline_id,data.confirm)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+    except (PipelineError,OutputError) as exc: raise HTTPException(409,str(exc)) from exc
+    except Exception as exc: raise HTTPException(503,f"Pipeline cannot be armed until destination verification succeeds: {exc}") from exc
+    store.audit("ARM_PIPELINE","pipeline",pipeline_id,{"operator_confirmation":data.confirm},actor)
+    return result
+
+
+@app.post("/api/pipelines/{pipeline_id}/disarm")
+async def disarm_pipeline(pipeline_id: str, actor=Depends(authorize)):
+    try: result=await pipelines.disarm(pipeline_id)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+    store.audit("DISARM_PIPELINE","pipeline",pipeline_id,{},actor)
+    return result
+
+
+@app.get("/api/pipelines/{pipeline_id}/status")
+async def pipeline_status(pipeline_id: str, _: str = Depends(authorize)):
+    result=pipelines.get(pipeline_id)
+    if not result: raise HTTPException(404,"Pipeline not found")
+    return result
+
+
+@app.get("/api/pipelines/{pipeline_id}/history")
+async def pipeline_history(pipeline_id: str, limit: int = Query(default=100,ge=1,le=500), _: str = Depends(authorize)):
+    try: return pipelines.history(pipeline_id,limit)
+    except KeyError as exc: raise HTTPException(404,str(exc)) from exc
+
+
 @app.get("/api/mappings")
 async def mappings(_: str = Depends(authorize)):
-    rows=store.rows("SELECT * FROM mappings ORDER BY name")
-    for row in rows: row["config_json"]=json.loads(row["config_json"])
-    return {"state":"PLANNED_OUTPUT_INTEGRATION_DISABLED","items":rows}
+    # Compatibility shape for existing Mapping page/API clients.
+    return {"state":"PIPELINE_ENGINE_AVAILABLE_OUTPUTS_REQUIRE_OPERATOR_ARMING","items":pipelines.list()}
 
 
 @app.get("/api/settings")
 async def settings(_: str = Depends(authorize)):
-    return {"tcp_listener":{"host":os.getenv("TCP_LISTEN_HOST","0.0.0.0"),"port":int(os.getenv("TCP_LISTEN_PORT","5001"))},"polling":{"minimum_interval_ms":250,"gateway_minimum_request_interval_ms":int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS","50")),"default_timeout_ms":1500,"max_retries":5},"freshness_seconds":int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),"event_retention_days":int(os.getenv("EVENT_RETENTION_DAYS","90")),"measurement_retention_days":int(os.getenv("MEASUREMENT_RETENTION_DAYS","365")),"hardware_writes":"DISABLED_UNTIL_PROFILE_VERIFIED"}
+    return {"tcp_listener":{"host":os.getenv("TCP_LISTEN_HOST","0.0.0.0"),"port":int(os.getenv("TCP_LISTEN_PORT","5001"))},"polling":{"minimum_interval_ms":250,"gateway_minimum_request_interval_ms":int(os.getenv("MODBUS_MIN_REQUEST_INTERVAL_MS","50")),"default_timeout_ms":1500,"max_retries":5},"freshness_seconds":int(os.getenv("DEFAULT_STALE_AFTER_SECONDS","30")),"event_retention_days":int(os.getenv("EVENT_RETENTION_DAYS","90")),"measurement_retention_days":int(os.getenv("MEASUREMENT_RETENTION_DAYS","365")),"hardware_writes":"ME31_AO_ONLY_AUTHORIZED_MANUAL_OR_ARMED_PIPELINE"}
 
 
 @app.websocket("/ws/telemetry")
