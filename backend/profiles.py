@@ -84,8 +84,11 @@ ME31_OUTPUT = {
             "data_type": "enum16_array",
             "values": {"0": "0–20 mA", "1": "4–20 mA"},
             "category": "Analog Output Configuration",
+            "default_interval_ms": 30000,
+            "channel_indices": [1, 2, 3, 4, 5, 6],
             "readable": True,
             "writable": False,
+            "polling_safe": True,
         },
         {
             "name": "AO setpoint readback",
@@ -96,8 +99,11 @@ ME31_OUTPUT = {
             "unit": "mA",
             "scale": 0.001,
             "category": "Analog Output Measurements",
+            "default_interval_ms": 2000,
+            "channel_indices": [1, 2, 3, 4, 5, 6],
             "readable": True,
             "writable": False,
+            "polling_safe": True,
             "description": "Reported setpoint in microampere; this is not a physical current measurement.",
         },
         *[
@@ -113,6 +119,7 @@ ME31_OUTPUT = {
                 "category": "Analog Output Commands",
                 "readable": False,
                 "writable": True,
+                "polling_safe": False,
                 "restricted_action": True,
             }
             for channel in range(1, 7)

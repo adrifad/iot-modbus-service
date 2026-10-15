@@ -143,6 +143,10 @@ Health checks default to read-only Modbus probes every 30 seconds after an idle 
 
 Calibration corrections are stored as immutable channel revisions. Raw register values and raw mA are retained on each measurement; calibrated mA and engineering values are stored separately. Scaling reports `OUT_OF_RANGE` and preserves the extrapolated value rather than silently clamping it. A source-disconnect callback runs the same centralized failure transition as polling loss: SAFE_SETPOINT is attempted once when the output path remains commissioned; an unavailable destination is reported `FAILSAFE_UNCONFIRMED`. Intentional backend shutdown suppresses fail-safe output writes.
 
+### Read-only output polling
+
+The Modbus Polling page supports both input and output nodes. For the fixed ME31-XXXA0006 output profile, it only offers read-only FC03 blocks: AO reported setpoints at `0x0064` (quantity 6, default 2000 ms, raw microampere values scaled to mA) and output ranges at `0x0514` (quantity 6, default 30000 ms; `0` is 0–20 mA, `1` is 4–20 mA, all other values are UNKNOWN). Output reads use the commissioned W630 `TRANSPARENT_SERIAL` session and its existing RTU CRC/parser and per-session transaction lock. Output polling allows only one in-flight/queued poll per gateway, skips missed intervals instead of building a request backlog, and cannot queue several read transactions ahead of control traffic. Polling values and quality/timing remain in each `polling_items.last_value` and status columns; they are not inserted into the analog input `measurements` table. Setpoint values are explicitly **Reported Setpoint (mA)** and are not measured physical current. Output command registers are excluded from polling; all FC16 actions remain restricted to the authorized OutputDriver/manual/pipeline paths. Polling readback never triggers a corrective FC16 command.
+
 ## Deployment notes
 
 ### Ubuntu systemd deployment

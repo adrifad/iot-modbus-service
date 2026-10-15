@@ -4,7 +4,7 @@ import unittest
 from uuid import uuid4
 
 from backend.gateway import GatewaySession
-from backend.modbus import StreamFrames
+from backend.modbus import StreamFrames, with_crc
 from backend.scheduler import PollScheduler
 from backend.profiles import ME31
 from backend.store import Store, utc_now
@@ -16,6 +16,90 @@ class Sessions:
 
 
 class SchedulerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_simulated_me31_output_poll_reads_setpoints_and_ranges_without_sensor_rows(self):
+        raw_setpoints = [4000, 12500, 20000, 0, 8000, 16000]
+        raw_ranges = [0, 1, 2, 0, 1, 0]
+
+        async def simulator(reader, writer):
+            try:
+                for address, values in ((0x0064, raw_setpoints), (0x0514, raw_ranges)):
+                    request = await reader.readexactly(8)
+                    self.assertEqual(request[0:2], bytes((1, 3)))
+                    self.assertEqual(int.from_bytes(request[2:4], "big"), address)
+                    self.assertEqual(int.from_bytes(request[4:6], "big"), 6)
+                    payload = bytes((1, 3, 12)) + b"".join(value.to_bytes(2, "big") for value in values)
+                    writer.write(with_crc(payload))
+                    await writer.drain()
+                await reader.read()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(simulator, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        store = Store(":memory:")
+        gateway_id, node_id = str(uuid4()), str(uuid4())
+        now = utc_now()
+        store.run("INSERT INTO gateways(id,name,transport_mode,created_at,updated_at) VALUES(?,?,?,?,?)",
+                  (gateway_id, "Simulated W630", "TRANSPARENT_SERIAL", now, now))
+        store.run("INSERT INTO nodes(id,name,node_type,hardware_model,gateway_id,slave_id,profile_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (node_id, "Simulated ME31 AO", "ANALOG_OUTPUT", "EBYTE ME31-XXXA0006", gateway_id, 1,
+                   "ebyte-me31-xxxa0006-v1.1", now, now))
+        item_ids = []
+        definitions = (
+            ("AO setpoint readback", 3, 0x0064, "uint16_array", 0.001, "mA", 2000),
+            ("AO output ranges", 3, 0x0514, "enum16_array", 1, "", 30000),
+        )
+        for name, function, address, data_type, factor, unit, interval in definitions:
+            item_id = str(uuid4())
+            item_ids.append(item_id)
+            store.run("""INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,
+                interval_ms,timeout_ms,retries,scale,unit,enabled,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+                (item_id, node_id, "ebyte-me31-xxxa0006-v1.1", name, function, address, 6, data_type,
+                 interval, 5000, 0, factor, unit, now, now))
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        session = GatewaySession(str(uuid4()), reader, writer, "127.0.0.1")
+        session.gateway_id = gateway_id
+        session.transport_mode = "TRANSPARENT_SERIAL"
+        session.state = "COMMISSIONED"
+        session.parser = StreamFrames.create("TRANSPARENT_SERIAL")
+
+        async def closed(*_): pass
+        async def invalid(_, detail): raise AssertionError(detail)
+        reader_task = asyncio.create_task(session.run_reader(closed, invalid))
+        scheduler = PollScheduler(store, Sessions(session))
+        try:
+            for item_id in item_ids:
+                item = store.one("""SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled,n.node_type,
+                    n.profile_id node_profile_id,n.hardware_model FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?""",
+                    (item_id,))
+                await scheduler.read_once(item)
+
+            setpoint = store.one("SELECT last_value,last_status,last_success_at,last_latency_ms FROM polling_items WHERE id=?", (item_ids[0],))
+            point_data = json.loads(setpoint["last_value"])
+            self.assertEqual(point_data["raw_registers"], raw_setpoints)
+            self.assertEqual(point_data["reported_setpoint_ma"], [4.0, 12.5, 20.0, 0.0, 8.0, 16.0])
+            self.assertEqual(setpoint["last_status"], "GOOD")
+            self.assertIsNotNone(setpoint["last_success_at"])
+            self.assertIsNotNone(setpoint["last_latency_ms"])
+
+            range_data = json.loads(store.one("SELECT last_value FROM polling_items WHERE id=?", (item_ids[1],))["last_value"])
+            self.assertEqual([row["label"] for row in range_data["output_ranges"]], ["0–20 mA", "4–20 mA", "UNKNOWN", "0–20 mA", "4–20 mA", "0–20 mA"])
+            self.assertEqual([row["quality"] for row in range_data["output_ranges"]][2], "UNKNOWN")
+            self.assertEqual(store.one("SELECT COUNT(*) count FROM measurements WHERE node_id=?", (node_id,))["count"], 0)
+            self.assertEqual(store.one("SELECT COUNT(*) count FROM events WHERE result='SUCCESS' AND protocol='TRANSPARENT_SERIAL'",())["count"], 2)
+            self.assertFalse(any("FC16" in event["detail"] for event in store.rows("SELECT detail FROM events WHERE node_id=?", (node_id,))))
+        finally:
+            writer.close()
+            try: await writer.wait_closed()
+            except ConnectionError: pass
+            await asyncio.wait_for(reader_task, 1)
+            server.close(); await server.wait_closed(); store.close()
+
     async def test_measurement_processing_failure_does_not_mark_poll_good(self):
         store=Store(":memory:")
         gateway_id,node_id,item_id=str(uuid4()),str(uuid4()),str(uuid4())

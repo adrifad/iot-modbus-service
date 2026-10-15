@@ -232,6 +232,43 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(output_node["profile_id"],"ebyte-me31-xxxa0006-v1.1")
                     channels=client.get(f"/api/nodes/{output_node['id']}/channels",headers=headers).json()
                     self.assertEqual([channel["label"] for channel in channels],[f"AO{i}" for i in range(1,7)])
+                    output_profile=client.get("/api/device-profiles",headers=headers).json()
+                    output_definitions=next(profile["registers"] for profile in output_profile if profile["id"]=="ebyte-me31-xxxa0006-v1.1")
+                    self.assertEqual({item["name"]:item["default_interval_ms"] for item in output_definitions if item.get("polling_safe")},
+                        {"AO output ranges":30000,"AO setpoint readback":2000})
+                    for item in output_definitions:
+                        if item.get("writable"):
+                            self.assertFalse(item.get("polling_safe",False))
+                    ao_readback=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
+                        "profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback",
+                        "function_code":3,"address":0x0064,"quantity":6,"data_type":"uint16_array",
+                        "retries":1,"scale":0.001,"unit":"mA"})
+                    self.assertEqual(ao_readback.status_code,201,ao_readback.text)
+                    self.assertEqual(ao_readback.json()["interval_ms"],2000)
+                    self.assertEqual(ao_readback.json()["timeout_ms"],5000)
+                    duplicate_readback=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
+                        "profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback",
+                        "function_code":3,"address":0x0064,"quantity":6,"data_type":"uint16_array",
+                        "interval_ms":2000,"timeout_ms":5000,"retries":1,"scale":0.001,"unit":"mA"})
+                    self.assertEqual(duplicate_readback.status_code,409)
+                    ao_ranges=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
+                        "profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO output ranges",
+                        "function_code":3,"address":0x0514,"quantity":6,"data_type":"enum16_array",
+                        "retries":0,"scale":1,"unit":""})
+                    self.assertEqual(ao_ranges.status_code,201,ao_ranges.text)
+                    self.assertEqual(ao_ranges.json()["interval_ms"],30000)
+                    self.assertEqual(ao_ranges.json()["timeout_ms"],5000)
+                    forbidden_output_items=[
+                        {"profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO1 setpoint command","function_code":16,"address":0,"quantity":2,"data_type":"float32"},
+                        {"profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback","function_code":6,"address":0x0064,"quantity":6,"data_type":"uint16_array"},
+                        {"profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"Custom AO register","function_code":3,"address":0x0100,"quantity":1,"data_type":"uint16"},
+                        {"profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback","function_code":3,"address":0x0064,"quantity":1,"data_type":"uint16_array"},
+                        {"profile_id":"ebyte-me31-xaxx0600-v1.1","register_name":"AI current block","function_code":4,"address":0x0064,"quantity":6,"data_type":"uint16_array"},
+                    ]
+                    for invalid_item in forbidden_output_items:
+                        rejected=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={**invalid_item,"interval_ms":1000,"timeout_ms":1500,"retries":0,"scale":0.001,"unit":"mA"})
+                        self.assertEqual(rejected.status_code,422,rejected.text)
+                    self.assertEqual(client.patch(f"/api/polling/{ao_readback.json()['id']}",headers=headers,json={"scale":2}).status_code,422)
                     invalid=client.post("/api/nodes",headers=headers,json={"name":"Wrong model","node_type":"ANALOG_OUTPUT","hardware_model":"Other AO","gateway_id":output_gateway["id"]})
                     self.assertEqual(invalid.status_code,422)
                     no_manual_confirm=client.post(f"/api/nodes/{output_node['id']}/outputs/1/set",headers=headers,json={"target_ma":4})
