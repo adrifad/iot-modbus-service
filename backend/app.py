@@ -573,8 +573,8 @@ class PollItemCreate(BaseModel):
     data_type: str = "uint16"
     byte_order: str = "big"
     word_order: str = "unverified"
-    interval_ms: int = Field(default=1000, ge=250, le=86400000)
-    timeout_ms: int = Field(default=1500, ge=100, le=60000)
+    interval_ms: int | None = Field(default=None, ge=250, le=86400000)
+    timeout_ms: int | None = Field(default=None, ge=100, le=60000)
     retries: int = Field(default=1, ge=0, le=5)
     scale: float = 1
     unit: str = ""
@@ -1184,20 +1184,41 @@ async def toggle_polling_group(node_id: str, category: str, enabled: bool = Quer
 @app.post("/api/nodes/{node_id}/polling", status_code=201)
 async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authorize)):
     node=require_active_node(node_id)
-    if node["node_type"] != "ANALOG_INPUT":
-        raise HTTPException(422,"Output-node polling requires a verified device profile")
+    if node["node_type"] == "ANALOG_OUTPUT":
+        if (node["profile_id"] != "ebyte-me31-xxxa0006-v1.1"
+                or node["hardware_model"] != "EBYTE ME31-XXXA0006"):
+            raise HTTPException(422,"Analog output polling requires the fixed ME31-XXXA0006 profile")
+        gateway=store.one("SELECT transport_mode FROM gateways WHERE id=?",(node["gateway_id"],))
+        if not gateway or gateway["transport_mode"] != "TRANSPARENT_SERIAL":
+            raise HTTPException(422,"ME31 output polling requires transparent RTU-over-TCP transport")
+        if data.profile_id != node["profile_id"]:
+            raise HTTPException(422,"Output polling requires the node's fixed ME31 output profile")
+    elif node["node_type"] != "ANALOG_INPUT":
+        raise HTTPException(422,"Unsupported node type for Modbus polling")
+    definition=None
     if data.profile_id:
         if data.profile_id != node["profile_id"]:
             raise HTTPException(422,"Polling profile must match the node's fixed ME31 hardware profile")
         definition=register(data.profile_id,data.register_name)
         if not definition or not definition.get("readable") or definition.get("restricted_action"):
             raise HTTPException(422,"Register profile entry is unavailable for polling")
+        if node["node_type"] == "ANALOG_OUTPUT" and (
+            not definition.get("polling_safe") or definition.get("writable")
+            or definition.get("function_code") != 3
+        ):
+            raise HTTPException(422,"Only verified read-only FC03 output registers may be polled")
         if definition.get("admin_only") and data.enabled:
             raise HTTPException(422,"Administrator-only profile items must be added disabled")
         if definition["function_code"] != data.function_code or definition["address"] != data.address or definition.get("quantity") != data.quantity:
             raise HTTPException(422,"Polling settings do not match the selected profile definition")
         if definition.get("data_type") != data.data_type:
             raise HTTPException(422,"Polling data type does not match the selected profile definition")
+        if node["node_type"] == "ANALOG_OUTPUT":
+            expected_scale=definition.get("scale",1)
+            if data.scale != expected_scale:
+                raise HTTPException(422,"Output polling scale is fixed by the ME31 register profile")
+            if data.unit != definition.get("unit",""):
+                raise HTTPException(422,"Output polling unit is fixed by the ME31 register profile")
         if data.data_type.startswith("float") and definition.get("quantity") != data.quantity:
             raise HTTPException(422,"Float polling quantity must match the register profile")
     if data.data_type.startswith("float"):
@@ -1207,16 +1228,22 @@ async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authoriz
             raise HTTPException(422,"Float polling must be verified against a known reference before it is enabled")
         if data.word_order not in {"BIG_WORD_FIRST", "LITTLE_WORD_FIRST", "unverified"}:
             raise HTTPException(422,"Unsupported float word order")
+    if node["node_type"] == "ANALOG_OUTPUT":
+        duplicate=store.one("SELECT id FROM polling_items WHERE node_id=? AND profile_id=? AND register_name=?",(node_id,data.profile_id,data.register_name))
+        if duplicate:
+            raise HTTPException(409,"This ME31 output register already has a polling item")
     item_id,now=data.id or str(uuid4()),utc_now()
     measurement_metadata=definition.get("measurement",{}) if data.profile_id else {}
-    store.run("INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,byte_order,word_order,interval_ms,timeout_ms,retries,scale,unit,measurement_metadata_json,float_verified,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(item_id,node_id,data.profile_id,data.register_name,data.function_code,data.address,data.quantity,data.data_type,data.byte_order,data.word_order,data.interval_ms,data.timeout_ms,data.retries,data.scale,data.unit,json.dumps(measurement_metadata),0,int(data.enabled),now,now))
-    store.audit("CREATE","polling_item",item_id,data.model_dump(),actor)
+    interval_ms=data.interval_ms if data.interval_ms is not None else (definition.get("default_interval_ms",1000) if definition else 1000)
+    timeout_ms=data.timeout_ms if data.timeout_ms is not None else (5000 if node["node_type"] == "ANALOG_OUTPUT" else 1500)
+    store.run("INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,byte_order,word_order,interval_ms,timeout_ms,retries,scale,unit,measurement_metadata_json,float_verified,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(item_id,node_id,data.profile_id,data.register_name,data.function_code,data.address,data.quantity,data.data_type,data.byte_order,data.word_order,interval_ms,timeout_ms,data.retries,data.scale,data.unit,json.dumps(measurement_metadata),0,int(data.enabled),now,now))
+    store.audit("CREATE","polling_item",item_id,{**data.model_dump(),"interval_ms":interval_ms,"timeout_ms":timeout_ms},actor)
     return store.one("SELECT * FROM polling_items WHERE id=?",(item_id,))
 
 
 @app.patch("/api/polling/{item_id}")
 async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
-    item=store.one("SELECT p.*,n.archived_at FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
+    item=store.one("SELECT p.*,n.archived_at,n.node_type,n.profile_id node_profile_id,n.hardware_model FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
     if not item:
         raise HTTPException(404,"Polling item not found")
     if item["archived_at"] is not None:
@@ -1224,6 +1251,18 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
     allowed={"enabled","interval_ms","timeout_ms","retries","scale","unit","byte_order","word_order"}
     if set(changes)-allowed:
         raise HTTPException(422,"Polling register identity cannot be changed in-place")
+    if item["node_type"] == "ANALOG_OUTPUT" and set(changes) & {"scale","unit","byte_order","word_order"}:
+        raise HTTPException(422,"ME31 output register decoding and scaling are fixed by its profile")
+    if item["node_type"] == "ANALOG_OUTPUT":
+        definition=register(item["profile_id"],item["register_name"])
+        if (item["node_profile_id"] != "ebyte-me31-xxxa0006-v1.1"
+                or item["hardware_model"] != "EBYTE ME31-XXXA0006"
+                or item["profile_id"] != item["node_profile_id"]
+                or not definition or not definition.get("polling_safe") or definition.get("writable")
+                or item["function_code"] != 3 or item["address"] != definition.get("address")
+                or item["quantity"] != definition.get("quantity") or item["data_type"] != definition.get("data_type")
+                or item["scale"] != definition.get("scale",1) or item["unit"] != definition.get("unit","")):
+            raise HTTPException(422,"Output polling item does not match a verified read-only ME31 register")
     if "enabled" in changes and not isinstance(changes["enabled"],bool): raise HTTPException(422,"enabled must be boolean")
     if "byte_order" in changes and changes["byte_order"] not in {"big","little"}: raise HTTPException(422,"Byte order must be big or little")
     if "word_order" in changes and changes["word_order"] not in {"BIG_WORD_FIRST","LITTLE_WORD_FIRST","unverified"}: raise HTTPException(422,"Unsupported word order")
@@ -1264,7 +1303,7 @@ async def delete_polling(item_id: str, actor=Depends(authorize)):
 
 @app.post("/api/polling/{item_id}/read")
 async def read_once(item_id: str, _: str = Depends(authorize)):
-    item=store.one("SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled,n.archived_at FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
+    item=store.one("SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled,n.archived_at,n.node_type,n.profile_id node_profile_id,n.hardware_model FROM polling_items p JOIN nodes n ON n.id=p.node_id WHERE p.id=?",(item_id,))
     if not item: raise HTTPException(404,"Polling item not found")
     if item["archived_at"] is not None: raise HTTPException(409,{"code":"NODE_ARCHIVED","message":"Archived nodes cannot be polled."})
     if not item["polling_enabled"]: raise HTTPException(409,"Node polling is disabled")

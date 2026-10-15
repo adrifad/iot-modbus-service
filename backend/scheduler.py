@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from .calibration import Calibration, Scaling, calibrate, scale
 from .modbus import ModbusError, ModbusExceptionResponse, decode_registers
 from .node_lifecycle import NodeOperationError, NodeOperationGate
+from .profiles import register
 from .store import utc_now
 
 
@@ -23,6 +24,9 @@ class PollScheduler:
         self.intervals: dict[str, int] = {}
         # One asyncio task may own several item IDs when their reads are batched.
         self.tasks: dict[str, asyncio.Task] = {}
+        # Keep output polling to one queued transaction per gateway so it
+        # cannot build a FIFO ahead of pipeline/manual control traffic.
+        self.output_gateway_tasks: dict[str, asyncio.Task] = {}
         self.running = False
         self.success = 0
         self.failed = 0
@@ -50,6 +54,7 @@ class PollScheduler:
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
         self.tasks.clear()
+        self.output_gateway_tasks.clear()
 
     def cancel_item(self, item_id: str):
         task = self.tasks.get(item_id)
@@ -85,12 +90,15 @@ class PollScheduler:
                 self.last_cleanup = now_mono
 
             items = self.store.rows("""
-                SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled
+                SELECT p.*,n.gateway_id,n.slave_id,n.polling_enabled,n.node_type,n.profile_id node_profile_id,n.hardware_model
                 FROM polling_items p JOIN nodes n ON n.id=p.node_id
                 WHERE p.enabled=1 AND n.polling_enabled=1 AND n.archived_at IS NULL
                 ORDER BY p.node_id,p.address,p.id
             """)
             current = {item["id"] for item in items}
+            for gateway_id, task in list(self.output_gateway_tasks.items()):
+                if task.done() and self.output_gateway_tasks.get(gateway_id) is task:
+                    self.output_gateway_tasks.pop(gateway_id, None)
             for item_id, task in list(self.tasks.items()):
                 if item_id not in current and not task.done():
                     task.cancel()
@@ -119,9 +127,17 @@ class PollScheduler:
                 due_items.append(item)
 
             for group in self._batch_due_items(due_items):
+                if group[0].get("node_type") == "ANALOG_OUTPUT":
+                    pending = self.output_gateway_tasks.get(group[0]["gateway_id"])
+                    if pending and not pending.done():
+                        # The item's next due time was already advanced; a
+                        # missed interval is skipped instead of queued.
+                        continue
                 task = asyncio.create_task(self._poll_group(group), name=f"poll-{group[0]['id']}")
                 for item in group:
                     self.tasks[item["id"]] = task
+                if group[0].get("node_type") == "ANALOG_OUTPUT":
+                    self.output_gateway_tasks[group[0]["gateway_id"]] = task
             await asyncio.sleep(0.1)
 
     def _cleanup_retention(self):
@@ -190,6 +206,26 @@ class PollScheduler:
             session = self.sessions.for_gateway(first["gateway_id"])
             if session is None:
                 raise ConnectionError("no commissioned gateway session")
+            is_output = first.get("node_type") == "ANALOG_OUTPUT"
+            if is_output:
+                if (first.get("node_profile_id") != "ebyte-me31-xxxa0006-v1.1"
+                        or first.get("profile_id") != first.get("node_profile_id")
+                        or first.get("hardware_model") != "EBYTE ME31-XXXA0006"):
+                    raise ValueError("output polling node does not match the fixed ME31 profile")
+                if session.transport_mode != "TRANSPARENT_SERIAL":
+                    raise ConnectionError("ME31 output polling requires transparent RTU-over-TCP framing")
+                if len(items) != 1:
+                    raise ValueError("output register blocks cannot be combined with other polling items")
+                definition = register(first["profile_id"], first["register_name"])
+                if (not definition or not definition.get("polling_safe") or definition.get("writable")
+                        or definition.get("function_code") != first["function_code"]
+                        or definition.get("address") != first["address"]
+                        or definition.get("quantity") != first["quantity"]
+                        or definition.get("data_type") != first["data_type"]
+                        or definition.get("scale", 1) != first["scale"]
+                        or definition.get("unit", "") != first["unit"]
+                        or first["function_code"] != 3):
+                    raise ValueError("output polling item is not an allowlisted read-only ME31 register")
             address = first["address"]
             quantity = sum(item["quantity"] for item in items)
             values = None
@@ -214,12 +250,15 @@ class PollScheduler:
                 offset += item["quantity"]
                 try:
                     decoded = decode_registers(raw_values, item["data_type"], byte_order=item["byte_order"], word_order=item["word_order"])
-                    value_json = json.dumps(self._scale_register_value(decoded, item["scale"]), allow_nan=False)
+                    if is_output:
+                        value_json = json.dumps(self._output_readback_value(item, raw_values, decoded), allow_nan=False)
+                    else:
+                        value_json = json.dumps(self._scale_register_value(decoded, item["scale"]), allow_nan=False)
                 except (ModbusError, ValueError, TypeError, OverflowError) as exc:
                     errors.append((item, f"{item['register_name']}: {exc}"))
                     continue
                 try:
-                    measurements = self._measurement_rows(item, raw_values, decoded, now)
+                    measurements = [] if is_output else self._measurement_rows(item, raw_values, decoded, now)
                 except Exception as exc:
                     measurements = None
                     measurement_errors.append((item, str(exc)))
@@ -235,7 +274,8 @@ class PollScheduler:
                             VALUES(?,?,?,?,?,?,?,?,?,?,?)""", measurements)
                 for item, detail in errors:
                     db.execute("UPDATE polling_items SET last_status='DECODE_ERROR',error_count=error_count+1,updated_at=? WHERE id=?", (now,item["id"]))
-            self.store.event("SUCCESS", "Validated Modbus read", gateway_id=first["gateway_id"],node_id=first["node_id"],direction="RX",protocol=session.transport_mode,function_code=first["function_code"],address=address,quantity=quantity,latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
+            detail = "Validated ME31 reported output setpoint readback" if is_output and first["register_name"] == "AO setpoint readback" else "Validated ME31 output range configuration" if is_output else "Validated Modbus read"
+            self.store.event("SUCCESS", detail, gateway_id=first["gateway_id"],node_id=first["node_id"],direction="RX",protocol=session.transport_mode,function_code=first["function_code"],address=address,quantity=quantity,latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
             for item, detail in errors:
                 self.failed += 1
                 self.store.event("DECODE_ERROR",detail,gateway_id=item["gateway_id"],node_id=item["node_id"],direction="RX",protocol=session.transport_mode,function_code=item["function_code"],address=item["address"],quantity=item["quantity"],latency_ms=latency,request_hex=request.hex(" "),response_hex=frame.hex(" "))
@@ -272,6 +312,33 @@ class PollScheduler:
         if isinstance(value, list):
             return [item * factor if isinstance(item, (int, float)) and not isinstance(item, bool) else item for item in value]
         return value * factor if isinstance(value, (int, float)) and not isinstance(value, bool) else value
+
+    @staticmethod
+    def _output_readback_value(item, raw_values, decoded):
+        """Persist output observations separately from input sensor measurements."""
+        if item["profile_id"] != "ebyte-me31-xxxa0006-v1.1":
+            raise ValueError("output polling requires the fixed ME31-XXXA0006 profile")
+        if item["function_code"] != 3 or item["quantity"] != 6 or len(raw_values) != 6:
+            raise ValueError("ME31 output polling requires a six-register FC03 block")
+        if item["register_name"] == "AO setpoint readback" and item["address"] == 0x0064:
+            if item["data_type"] != "uint16_array":
+                raise ValueError("AO setpoint readback must use uint16_array decoding")
+            values = decoded if isinstance(decoded, list) else [decoded]
+            if len(values) != 6:
+                raise ValueError("AO setpoint readback must contain six channels")
+            return {"raw_registers": raw_values, "reported_setpoint_ma": [value * item["scale"] for value in values]}
+        if item["register_name"] == "AO output ranges" and item["address"] == 0x0514:
+            if item["data_type"] != "enum16_array":
+                raise ValueError("AO output ranges must use enum16_array decoding")
+            values = decoded if isinstance(decoded, list) else [decoded]
+            if len(values) != 6:
+                raise ValueError("AO output range readback must contain six channels")
+            labels = {0: "0–20 mA", 1: "4–20 mA"}
+            return {"raw_registers": raw_values, "output_ranges": [
+                {"raw_value": value, "label": labels.get(value, "UNKNOWN"), "quality": "GOOD" if value in labels else "UNKNOWN"}
+                for value in values
+            ]}
+        raise ValueError("register is not an allowlisted ME31 output polling item")
 
     def _measurement_rows(self, item, raw_values, decoded, measured_at):
         try:
