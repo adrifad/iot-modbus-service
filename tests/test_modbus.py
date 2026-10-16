@@ -2,7 +2,8 @@ import unittest
 
 from backend.modbus import (
     ModbusError, ModbusExceptionResponse, StreamFrames, build_request, decode_registers,
-    build_me31_ao_write_request, crc16, decode_response, decode_write_ack, with_crc,
+    build_me31_ao_range_request, build_me31_ao_write_request, crc16, decode_response,
+    decode_write_ack, decode_write_single_ack, with_crc,
 )
 
 
@@ -117,6 +118,36 @@ class ModbusCodecTests(unittest.TestCase):
         ack = with_crc(bytes.fromhex("01 10 00 02 00 02"))
         self.assertEqual(parser.push(ack[:3]), [])
         self.assertEqual(parser.push(ack[3:]), [ack])
+
+    def test_me31_ao_fc06_range_request_is_single_register_allowlisted(self):
+        ao1 = build_me31_ao_range_request("TRANSPARENT_SERIAL", 1, 1, 1)
+        ao6 = build_me31_ao_range_request("TRANSPARENT_SERIAL", 1, 6, 0)
+        self.assertEqual(ao1[:6], bytes.fromhex("01 06 05 14 00 01"))
+        self.assertEqual(ao6[:6], bytes.fromhex("01 06 05 19 00 00"))
+        self.assertEqual(crc16(ao1[:-2]), int.from_bytes(ao1[-2:], "little"))
+        with self.assertRaises(ValueError):
+            build_me31_ao_range_request("TRANSPARENT_SERIAL", 1, 1, 2)
+        with self.assertRaises(ValueError):
+            build_me31_ao_range_request("TRANSPARENT_SERIAL", 1, 7, 0)
+
+    def test_me31_ao_fc06_ack_crc_echo_and_exception(self):
+        ack = with_crc(bytes.fromhex("01 06 05 14 00 01"))
+        decode_write_single_ack("TRANSPARENT_SERIAL", ack, unit_id=1, address=0x0514, value=1)
+        with self.assertRaisesRegex(ModbusError, "echo"):
+            decode_write_single_ack("TRANSPARENT_SERIAL", ack, unit_id=1, address=0x0515, value=1)
+        bad = ack[:-1] + bytes((ack[-1] ^ 1,))
+        with self.assertRaisesRegex(ModbusError, "CRC"):
+            decode_write_single_ack("TRANSPARENT_SERIAL", bad, unit_id=1, address=0x0514, value=1)
+        with self.assertRaises(ModbusExceptionResponse):
+            decode_write_single_ack("TRANSPARENT_SERIAL", with_crc(bytes.fromhex("01 86 02")),
+                                    unit_id=1, address=0x0514, value=1)
+
+    def test_rtu_parser_handles_fragmented_fc06_ack_and_exception(self):
+        parser = StreamFrames.create("TRANSPARENT_SERIAL")
+        ack = with_crc(bytes.fromhex("01 06 05 19 00 01"))
+        exception = with_crc(bytes.fromhex("01 86 02"))
+        self.assertEqual(parser.push(ack[:4]), [])
+        self.assertEqual(parser.push(ack[4:] + exception), [ack, exception])
 
 
 if __name__ == "__main__":

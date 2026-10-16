@@ -65,6 +65,50 @@ def build_me31_ao_write_request(mode: str, unit_id: int, channel: int, value_ma:
     return with_crc(bytes((unit_id,)) + pdu)
 
 
+def build_me31_ao_range_request(mode: str, unit_id: int, channel: int, range_code: int, transaction_id: int = 1) -> bytes:
+    """Build the allowlisted FC06 write for one ME31-XXXA0006 AO range."""
+    if mode not in {"MODBUS_TCP", "MODBUS_RTU", "TRANSPARENT_SERIAL"}:
+        raise ValueError("unsupported gateway transport mode")
+    if unit_id not in range(1, 248):
+        raise ValueError("Modbus slave ID must be 1–247")
+    if channel not in range(1, 7):
+        raise ValueError("ME31 output channel must be AO1–AO6")
+    if isinstance(range_code, bool) or range_code not in (0, 1):
+        raise ValueError("ME31 output range must be 0 (0–20 mA) or 1 (4–20 mA)")
+    address = 0x0513 + channel
+    pdu = bytes((6, address >> 8, address & 0xFF, 0, range_code))
+    if mode == "MODBUS_TCP":
+        return transaction_id.to_bytes(2, "big") + b"\x00\x00" + (len(pdu) + 1).to_bytes(2, "big") + bytes((unit_id,)) + pdu
+    return with_crc(bytes((unit_id,)) + pdu)
+
+
+def decode_write_single_ack(mode: str, frame: bytes, *, unit_id: int, address: int,
+                            value: int, transaction_id: int | None = None) -> None:
+    """Validate the exact FC06 echo used for a ME31 AO range change."""
+    if mode == "MODBUS_TCP":
+        if len(frame) not in {9, 12} or (transaction_id is not None and int.from_bytes(frame[:2], "big") != transaction_id):
+            raise ModbusError("invalid Modbus TCP FC06 acknowledgement length or transaction identifier")
+        if frame[2:4] != b"\x00\x00" or int.from_bytes(frame[4:6], "big") != len(frame) - 6:
+            raise ModbusError("invalid Modbus TCP FC06 acknowledgement header")
+        if frame[6] != unit_id:
+            raise ModbusError("unit identifier mismatch")
+        function, body = frame[7], frame[8:]
+    else:
+        if len(frame) not in {5, 8} or frame[0] != unit_id:
+            raise ModbusError("invalid RTU FC06 acknowledgement length or slave identifier")
+        if crc16(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+            raise ModbusError("RTU CRC mismatch")
+        function, body = frame[1], frame[2:-2]
+    if function == 0x86:
+        if len(body) != 1:
+            raise ModbusError("invalid Modbus exception response length")
+        raise ModbusExceptionResponse(6, body[0])
+    if function != 6:
+        raise ModbusError(f"function code mismatch: expected 6, received {function}")
+    if len(body) != 4 or int.from_bytes(body[:2], "big") != address or int.from_bytes(body[2:], "big") != value:
+        raise ModbusError("FC06 acknowledgement did not echo the requested address and value")
+
+
 def decode_write_ack(mode: str, frame: bytes, *, unit_id: int, address: int, quantity: int = 2, transaction_id: int | None = None) -> None:
     """Validate an FC16 acknowledgement, including the echoed address/count."""
     if mode == "MODBUS_TCP":
@@ -233,7 +277,7 @@ class StreamFrames:
                     self.errors.append("discarded RTU byte outside slave address range")
                     continue
                 function = self.buffer[1]
-                if function in (0x83, 0x84, 0x90):
+                if function in (0x83, 0x84, 0x86, 0x90):
                     total = 5
                 elif function in (3, 4):
                     if len(self.buffer) < 3:
@@ -244,7 +288,7 @@ class StreamFrames:
                         self.errors.append("invalid RTU register byte count; resynchronizing")
                         continue
                     total = 5 + byte_count
-                elif function == 16:
+                elif function in (6, 16):
                     total = 8
                 else:
                     del self.buffer[0]
@@ -259,13 +303,15 @@ class StreamFrames:
                     if self.buffer[offset] not in range(1, 248):
                         continue
                     function = self.buffer[offset + 1]
-                    if function in (0x83, 0x84, 0x90):
+                    if function in (0x83, 0x84, 0x86, 0x90):
                         candidate_length = 5
                     elif function in (3, 4) and offset + 3 <= len(self.buffer):
                         byte_count = self.buffer[offset + 2]
                         if byte_count == 0 or byte_count > 250 or byte_count % 2:
                             continue
                         candidate_length = 5 + byte_count
+                    elif function in (6, 16):
+                        candidate_length = 8
                     else:
                         continue
                     end = offset + candidate_length

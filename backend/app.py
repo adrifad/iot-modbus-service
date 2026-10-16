@@ -31,7 +31,7 @@ from .output import OutputDriver, OutputError
 from .pipelines import PipelineError, PipelineService
 from .profiles import PROFILES, register
 from .scheduler import PollScheduler
-from .store import Store, utc_now
+from .store import Store, insert_default_ao_polling, utc_now
 
 
 class SessionRegistry:
@@ -217,19 +217,20 @@ def _node_modbus_health(node, items, gateway_connected):
             return "DISCONNECTED"
         if not node.get("polling_enabled"):
             return "DISABLED"
-        if not node.get("id"):
+        output_items = [item for item in items if item.get("profile_id") == "ebyte-me31-xxxa0006-v1.1"
+                        and item.get("register_name") in {"AO setpoint readback", "AO output ranges"}]
+        if not output_items:
             return "UNKNOWN"
-        recent=store.one("SELECT at,result FROM events WHERE node_id=? AND result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED','OUTPUT_READ_FAILED','OUTPUT_WRITE_FAILED','OUTPUT_READBACK_FAILED') ORDER BY id DESC LIMIT 1",(node["id"],))
-        if not recent:
-            return "UNKNOWN"
-        if recent["result"] in {"OUTPUT_READ_FAILED","OUTPUT_WRITE_FAILED","OUTPUT_READBACK_FAILED"}:
-            return "MODBUS_ERROR"
-        try:
-            timestamp=datetime.fromisoformat(recent["at"])
-            if timestamp.tzinfo is None: timestamp=timestamp.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc)-timestamp).total_seconds()>int(os.getenv("OUTPUT_STATUS_FRESHNESS_SECONDS","120")):
-                return "STALE"
-        except (TypeError,ValueError):
+        enabled = [item for item in output_items if item["enabled"]]
+        if not enabled:
+            return "DISABLED"
+        states = [_item_health(item) for item in enabled]
+        for state in ("MODBUS_ERROR", "INVALID_RESPONSE", "DECODE_ERROR", "POLL_ERROR", "TIMEOUT", "DISCONNECTED"):
+            if state in states:
+                return state
+        if "STALE" in states:
+            return "STALE"
+        if "UNKNOWN" in states:
             return "UNKNOWN"
         return "RESPONDING"
     if not gateway_connected:
@@ -558,6 +559,17 @@ class OutputSetpointInput(BaseModel):
         return value
 
 
+class OutputRangeInput(BaseModel):
+    range_code: int = Field(ge=0, le=1)
+    confirm: bool = False
+
+    @field_validator("range_code", mode="before")
+    @classmethod
+    def range_must_be_integer(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("range_code must be integer 0 or 1")
+        return value
+
 class OutputTimeoutSettings(BaseModel):
     output_range_timeout_ms: int = Field(ge=250, le=30000)
     output_write_timeout_ms: int = Field(ge=250, le=30000)
@@ -693,7 +705,7 @@ async def overview(_: str = Depends(authorize)):
     node_summary = []
     for node in nodes:
         last = store.one("SELECT MAX(measured_at) at FROM measurements WHERE node_id=?", (node["id"],))
-        last_modbus=store.one("SELECT MAX(at) at FROM events WHERE node_id=? AND result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED')",(node["id"],)) if node["node_type"]=="ANALOG_OUTPUT" else {"at":None}
+        last_modbus=store.one("SELECT MAX(at) at FROM events WHERE node_id=? AND ((result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED','OUTPUT_RANGE_CHANGE_ACKNOWLEDGED','NO_CHANGE')) OR (result='SUCCESS' AND function_code=3 AND address IN (100,1300)))",(node["id"],)) if node["node_type"]=="ANALOG_OUTPUT" else {"at":None}
         item_count = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1", (node["id"],))["count"]
         items=store.rows("SELECT * FROM polling_items WHERE node_id=?",(node["id"],))
         gateway_connected=node["gateway_id"] in connected_gateway_ids
@@ -947,7 +959,7 @@ async def list_nodes(type: str | None = Query(default=None), search: str | None 
         node["enabled_channel_count"] = store.one("SELECT COUNT(*) count FROM channels WHERE node_id=? AND enabled=1",(node["id"],))["count"]
         latest=store.one("SELECT MAX(measured_at) at FROM measurements WHERE node_id=?",(node["id"],))
         node["last_measurement_at"]=latest["at"]
-        last_modbus=store.one("SELECT MAX(at) at FROM events WHERE node_id=? AND result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED')",(node["id"],)) if node["node_type"]=="ANALOG_OUTPUT" else {"at":None}
+        last_modbus=store.one("SELECT MAX(at) at FROM events WHERE node_id=? AND ((result IN ('OUTPUT_RANGE_READ','OUTPUT_SETPOINT_READ','OUTPUT_RANGE_CHECK','OUTPUT_READBACK','OUTPUT_WRITE_ACKNOWLEDGED','OUTPUT_RANGE_CHANGE_ACKNOWLEDGED','NO_CHANGE')) OR (result='SUCCESS' AND function_code=3 AND address IN (100,1300)))",(node["id"],)) if node["node_type"]=="ANALOG_OUTPUT" else {"at":None}
         node["last_modbus_at"]=last_modbus["at"]
         node["gateway_connected"]=node["gateway_id"] in connected
         node["gateway_state"]="CONNECTED" if node["gateway_connected"] else "DISCONNECTED" if node["gateway_id"] else "UNKNOWN"
@@ -984,6 +996,8 @@ async def create_node(data: NodeCreate, actor=Depends(authorize)):
             for channel in range(1,7):
                 db.execute("INSERT INTO channels(id,node_id,channel_index,channel_type,label,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                     (str(uuid4()),node_id,channel,channel_type,f"{prefix}{channel}",now,now))
+            if data.node_type == "ANALOG_OUTPUT":
+                insert_default_ao_polling(db, node_id, now)
     except Exception as exc:
         raise HTTPException(409,"Node ID already exists or configuration conflicts with the fixed six-channel ME31 profile") from exc
     store.audit("CREATE","node",node_id,{**data.model_dump(),"hardware_model":hardware_model,"profile_id":profile_id},actor)
@@ -1203,7 +1217,7 @@ async def add_polling(node_id: str, data: PollItemCreate, actor=Depends(authoriz
         if not definition or not definition.get("readable") or definition.get("restricted_action"):
             raise HTTPException(422,"Register profile entry is unavailable for polling")
         if node["node_type"] == "ANALOG_OUTPUT" and (
-            not definition.get("polling_safe") or definition.get("writable")
+            not definition.get("polling_safe")
             or definition.get("function_code") != 3
         ):
             raise HTTPException(422,"Only verified read-only FC03 output registers may be polled")
@@ -1258,7 +1272,7 @@ async def patch_polling(item_id: str, changes: dict, actor=Depends(authorize)):
         if (item["node_profile_id"] != "ebyte-me31-xxxa0006-v1.1"
                 or item["hardware_model"] != "EBYTE ME31-XXXA0006"
                 or item["profile_id"] != item["node_profile_id"]
-                or not definition or not definition.get("polling_safe") or definition.get("writable")
+                or not definition or not definition.get("polling_safe")
                 or item["function_code"] != 3 or item["address"] != definition.get("address")
                 or item["quantity"] != definition.get("quantity") or item["data_type"] != definition.get("data_type")
                 or item["scale"] != definition.get("scale",1) or item["unit"] != definition.get("unit","")):
@@ -1504,6 +1518,36 @@ async def manual_output_set(node_id: str, channel: int, data: OutputSetpointInpu
     except Exception as exc:
         raise HTTPException(502,f"AO command did not complete and read back successfully: {exc}") from exc
     store.audit("MANUAL_OUTPUT_SET","node",node_id,{"channel":channel,"target_ma":data.target_ma,"acknowledged_ma":result["acknowledged_ma"],"operator_confirmation":True},actor)
+    return result
+
+
+@app.put("/api/nodes/{node_id}/outputs/{channel}/range")
+async def configure_output_range(node_id: str, channel: int, data: OutputRangeInput, actor=Depends(authorize)):
+    node = require_active_node(node_id)
+    if node["node_type"] != "ANALOG_OUTPUT":
+        raise HTTPException(422, "Node is not an analog output")
+    if not data.confirm:
+        raise HTTPException(422, "Explicit confirmation is required before changing the physical output range")
+    try:
+        result = await output_driver.set_output_range(node_id, channel, data.range_code, confirm=data.confirm)
+    except OutputError as exc:
+        store.audit("OUTPUT_RANGE_CHANGE_REJECTED", "node", node_id,
+                    {"channel": channel, "range_code": data.range_code, "reason": str(exc)}, actor)
+        code = 409 if any(term in str(exc).lower() for term in ("locked", "pipeline", "disabled", "archived", "being archived")) else 422
+        raise HTTPException(code, str(exc)) from exc
+    except (ConnectionError, TimeoutError) as exc:
+        store.audit("OUTPUT_RANGE_CHANGE_FAILED", "node", node_id,
+                    {"channel": channel, "range_code": data.range_code, "reason": str(exc)}, actor)
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        store.audit("OUTPUT_RANGE_CHANGE_FAILED", "node", node_id,
+                    {"channel": channel, "range_code": data.range_code, "reason": str(exc)}, actor)
+        raise HTTPException(502, f"AO range change was not confirmed by FC03 readback: {exc}") from exc
+    store.audit("OUTPUT_RANGE_CHANGE", "node", node_id,
+                {"channel": channel, "previous_range_code": result["previous_range_code"],
+                 "requested_range_code": data.range_code, "status": result["status"],
+                 "readback_confirmed": True, "reported_setpoint_ma": result["reported_setpoint_ma"],
+                 "operator_confirmation": True}, actor)
     return result
 
 

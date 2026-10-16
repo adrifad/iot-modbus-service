@@ -25,4 +25,21 @@ The output configuration in the application follows the operator-provided bench 
 - AO1–AO6 writes: FC16 to `0x0000`, `0x0002`, `0x0004`, `0x0006`, `0x0008`, `0x000A`; exactly two registers, IEEE-754 Float32 big-word-first. The driver accepts no other output write address or function.
 - Every write is serialized with other transactions on the gateway, validates the FC16 echo, then reads the integer setpoint block and checks the selected channel against the target within 0.05 mA.
 
+The ME31-XXXA0006 English V1.1 manual register table identifies the six AO range registers at `0x0514` as RW and lists FC06 and FC10 as write functions. The application implements only the narrow FC06 single-register write for an individual channel, validates its echo and requires a full FC03 range-block readback. [Manual copy with register table](https://manuals.plus/ebyte/me31-xxxa0006-network-i-o-networking-module-manual.pdf) · [Manufacturer product page](https://www.ebyte.com/product/2047.html). Verify the exact deployed hardware revision and whether the range setting persists across power cycles before relying on it. Automated simulation is not hardware validation.
+
 The reported setpoint register is device readback, not an independent measurement of physical output current. The FC16 map and frame encoding were supplied as already verified by the operator, but this checkout has not performed a physical W630/ME31 write. Automated tests use a local RTU simulator and never connect to industrial hardware. Commission with a current-limited/known-safe load and a calibrated external meter before enabling live output pipelines.
+
+## Bench checklist for AO range configuration and recovery
+
+Run this only with an authorized operator and a safe test load:
+
+1. Confirm G781 AI communication using the verified MBAP/Modbus TCP framing and FC04 `0x0064`, quantity 6.
+2. Confirm W630 passes transparent RTU ADUs with valid CRC over its dedicated session; do not configure it as Modbus TCP conversion.
+3. Confirm both default AO polling items are enabled and display reported setpoints plus range codes for AO1–AO6.
+4. Compare AO setpoint register values at `0x0064` with the configured output setpoints. Label them reported setpoints; independently measure current with a calibrated meter.
+5. Confirm range values at `0x0514` map as expected. Unknown values must remain UNKNOWN.
+6. Verify FC06 support for the exact device firmware. With the load in a safe test condition, explicitly authorize a single-channel range change and confirm FC06 acknowledgement plus FC03 full-block readback.
+7. Verify the selected range remains configured after a controlled power cycle if persistence is required by the installation.
+8. Independently measure physical current before and after any range change. FC03 readback alone is not electrical verification.
+9. Interrupt and restore G781 and W630 connectivity separately through the authenticated WireGuard router/relay. Verify automatic commissioning, a new session generation, and polling recovery without manual Assign.
+10. Confirm reconnect issues no FC16 and no automatic range write. Pipelines must remain disarmed until an operator checks source freshness and current AO readback, then explicitly re-arms them.

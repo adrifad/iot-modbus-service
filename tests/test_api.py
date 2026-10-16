@@ -4,7 +4,7 @@ import hashlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -236,28 +236,28 @@ class ApiTests(unittest.TestCase):
                     output_definitions=next(profile["registers"] for profile in output_profile if profile["id"]=="ebyte-me31-xxxa0006-v1.1")
                     self.assertEqual({item["name"]:item["default_interval_ms"] for item in output_definitions if item.get("polling_safe")},
                         {"AO output ranges":30000,"AO setpoint readback":2000})
-                    for item in output_definitions:
-                        if item.get("writable"):
-                            self.assertFalse(item.get("polling_safe",False))
-                    ao_readback=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
-                        "profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback",
-                        "function_code":3,"address":0x0064,"quantity":6,"data_type":"uint16_array",
-                        "retries":1,"scale":0.001,"unit":"mA"})
-                    self.assertEqual(ao_readback.status_code,201,ao_readback.text)
-                    self.assertEqual(ao_readback.json()["interval_ms"],2000)
-                    self.assertEqual(ao_readback.json()["timeout_ms"],5000)
+                    range_definition=next(item for item in output_definitions if item["name"]=="AO output ranges")
+                    self.assertTrue(range_definition["writable"])
+                    self.assertTrue(range_definition["polling_safe"])
+                    ao_items=client.get(f"/api/nodes/{output_node['id']}/polling",headers=headers).json()
+                    self.assertEqual({item["register_name"] for item in ao_items},{"AO output ranges","AO setpoint readback"})
+                    self.assertTrue(all(item["enabled"] for item in ao_items))
+                    ao_readback=next(item for item in ao_items if item["register_name"]=="AO setpoint readback")
+                    ao_ranges=next(item for item in ao_items if item["register_name"]=="AO output ranges")
+                    self.assertEqual(ao_readback["interval_ms"],2000)
+                    self.assertEqual(ao_readback["timeout_ms"],5000)
+                    self.assertEqual(ao_ranges["interval_ms"],30000)
+                    self.assertEqual(ao_ranges["timeout_ms"],5000)
                     duplicate_readback=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
                         "profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback",
                         "function_code":3,"address":0x0064,"quantity":6,"data_type":"uint16_array",
-                        "interval_ms":2000,"timeout_ms":5000,"retries":1,"scale":0.001,"unit":"mA"})
+                        "retries":1,"scale":0.001,"unit":"mA"})
                     self.assertEqual(duplicate_readback.status_code,409)
-                    ao_ranges=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
+                    duplicate_ranges=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={
                         "profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO output ranges",
                         "function_code":3,"address":0x0514,"quantity":6,"data_type":"enum16_array",
                         "retries":0,"scale":1,"unit":""})
-                    self.assertEqual(ao_ranges.status_code,201,ao_ranges.text)
-                    self.assertEqual(ao_ranges.json()["interval_ms"],30000)
-                    self.assertEqual(ao_ranges.json()["timeout_ms"],5000)
+                    self.assertEqual(duplicate_ranges.status_code,409)
                     forbidden_output_items=[
                         {"profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO1 setpoint command","function_code":16,"address":0,"quantity":2,"data_type":"float32"},
                         {"profile_id":"ebyte-me31-xxxa0006-v1.1","register_name":"AO setpoint readback","function_code":6,"address":0x0064,"quantity":6,"data_type":"uint16_array"},
@@ -268,11 +268,19 @@ class ApiTests(unittest.TestCase):
                     for invalid_item in forbidden_output_items:
                         rejected=client.post(f"/api/nodes/{output_node['id']}/polling",headers=headers,json={**invalid_item,"interval_ms":1000,"timeout_ms":1500,"retries":0,"scale":0.001,"unit":"mA"})
                         self.assertEqual(rejected.status_code,422,rejected.text)
-                    self.assertEqual(client.patch(f"/api/polling/{ao_readback.json()['id']}",headers=headers,json={"scale":2}).status_code,422)
+                    self.assertEqual(client.patch(f"/api/polling/{ao_readback['id']}",headers=headers,json={"scale":2}).status_code,422)
                     invalid=client.post("/api/nodes",headers=headers,json={"name":"Wrong model","node_type":"ANALOG_OUTPUT","hardware_model":"Other AO","gateway_id":output_gateway["id"]})
                     self.assertEqual(invalid.status_code,422)
                     no_manual_confirm=client.post(f"/api/nodes/{output_node['id']}/outputs/1/set",headers=headers,json={"target_ma":4})
                     self.assertEqual(no_manual_confirm.status_code,422)
+                    missing_range_confirm=client.put(f"/api/nodes/{output_node['id']}/outputs/1/range",headers=headers,json={"range_code":1})
+                    self.assertEqual(missing_range_confirm.status_code,422)
+                    range_result={"channel":1,"range_code":1,"range_label":"4–20 mA","previous_range_code":0,"changed":True,"reported_setpoint_ma":4.0,"status":"ACKNOWLEDGED","updated_at":"2026-10-16T00:00:00+00:00","request_hex":"01 06 ...","response_hex":"01 06 ...","latency_ms":12.0}
+                    with patch.object(service.output_driver, "set_output_range", new_callable=AsyncMock, return_value=range_result) as set_range:
+                        configured=client.put(f"/api/nodes/{output_node['id']}/outputs/1/range",headers=headers,json={"range_code":1,"confirm":True})
+                    self.assertEqual(configured.status_code,200,configured.text)
+                    self.assertEqual(configured.json()["status"],"ACKNOWLEDGED")
+                    set_range.assert_awaited_once_with(output_node["id"],1,1,confirm=True)
 
                     definition={"name":"AI1 to AO2","source_node_id":input_node["id"],"source_channel":1,
                         "destination_node_id":output_node["id"],"destination_channel":2,"source_value_type":"CALIBRATED_MA",

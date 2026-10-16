@@ -265,5 +265,53 @@ class SchedulerBatchTests(unittest.TestCase):
         scheduler.store.close()
 
 
+class SchedulerFairnessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_due_output_range_gets_turn_after_setpoint_even_with_longer_interval(self):
+        store = Store(":memory:")
+        gateway_id, node_id = str(uuid4()), str(uuid4())
+        now = utc_now()
+        store.run("INSERT INTO gateways(id,name,transport_mode,created_at,updated_at) VALUES(?,?,?,?,?)",
+                  (gateway_id, "W630", "TRANSPARENT_SERIAL", now, now))
+        store.run("INSERT INTO nodes(id,name,node_type,hardware_model,gateway_id,slave_id,profile_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (node_id, "AO node", "ANALOG_OUTPUT", "EBYTE ME31-XXXA0006", gateway_id, 1,
+                   "ebyte-me31-xxxa0006-v1.1", now, now))
+        for name, address, interval, data_type in (
+            ("AO setpoint readback", 0x0064, 2000, "uint16_array"),
+            ("AO output ranges", 0x0514, 30000, "enum16_array"),
+        ):
+            store.run("""INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,
+                interval_ms,timeout_ms,retries,scale,unit,enabled,created_at,updated_at)
+                VALUES(?,?,?,?,3,?,6,?, ?,5000,0,1,'',1,?,?)""",
+                (str(uuid4()), node_id, "ebyte-me31-xxxa0006-v1.1", name, address, data_type, interval, now, now))
+        scheduler = PollScheduler(store, None)
+        setpoint_started = asyncio.Event()
+        release_setpoint = asyncio.Event()
+        range_started = asyncio.Event()
+        dispatches = []
+
+        async def fake_poll(items):
+            name = items[0]["register_name"]
+            dispatches.append(name)
+            if name == "AO setpoint readback":
+                setpoint_started.set()
+                await release_setpoint.wait()
+            else:
+                range_started.set()
+
+        scheduler._poll_group_active = fake_poll
+        scheduler.start()
+        try:
+            await asyncio.wait_for(setpoint_started.wait(), 1)
+            await asyncio.sleep(0.2)
+            self.assertFalse(range_started.is_set(), "shared gateway must keep only one output poll in flight")
+            release_setpoint.set()
+            await asyncio.wait_for(range_started.wait(), 1)
+            self.assertEqual(dispatches[:2], ["AO setpoint readback", "AO output ranges"])
+        finally:
+            release_setpoint.set()
+            await scheduler.stop()
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

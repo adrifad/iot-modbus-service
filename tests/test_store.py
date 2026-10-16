@@ -28,7 +28,7 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(second.one("SELECT name FROM gateways WHERE id=?", (gateway_id,))["name"], "Persistent gateway")
                 binding=second.one("SELECT auto_reconnect_enabled,trusted_ingress_id,trusted_peer_ip,listener_port,session_generation,last_session_id FROM gateways WHERE id=?",(gateway_id,))
                 self.assertEqual(binding,{"auto_reconnect_enabled":1,"trusted_ingress_id":"west-wg","trusted_peer_ip":"10.70.0.11","listener_port":5101,"session_generation":7,"last_session_id":"session-7"})
-                self.assertEqual(second.one("SELECT MAX(version) version FROM schema_migrations")["version"], 14)
+                self.assertEqual(second.one("SELECT MAX(version) version FROM schema_migrations")["version"], 15)
                 self.assertTrue(path.exists())
             finally:
                 second.close()
@@ -59,14 +59,42 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(migrated.one("SELECT COUNT(*) count FROM channels WHERE node_id='legacy-ao'")["count"],6)
                 self.assertEqual(migrated.one("SELECT COUNT(*) count FROM measurements WHERE node_id='legacy-ao'")["count"],1)
                 self.assertEqual(migrated.one("SELECT revision FROM calibrations WHERE node_id='legacy-ao'")["revision"],7)
+                items=migrated.rows("SELECT register_name,interval_ms,enabled FROM polling_items WHERE node_id='legacy-ao' ORDER BY register_name")
+                self.assertEqual(items,[
+                    {"register_name":"AO output ranges","interval_ms":30000,"enabled":1},
+                    {"register_name":"AO setpoint readback","interval_ms":2000,"enabled":1},
+                ])
+                self.assertEqual(migrated.one("SELECT MAX(version) version FROM schema_migrations")["version"],15)
             finally:
                 migrated.close()
             reopened=Store(str(path))
             try:
-                self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],14)
+                self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],15)
                 self.assertEqual(reopened.one("SELECT COUNT(*) count FROM channels WHERE node_id='legacy-ao'")["count"],6)
+                self.assertEqual(reopened.one("SELECT COUNT(*) count FROM polling_items WHERE node_id='legacy-ao'")["count"],2)
             finally:
                 reopened.close()
+
+    def test_ao_polling_backfill_preserves_disabled_item_and_skips_archived_node(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"ao-backfill.db"
+            store=Store(str(path))
+            now=utc_now()
+            for node_id in ("active-ao", "archived-ao"):
+                store.run("INSERT INTO nodes(id,name,node_type,hardware_model,profile_id,polling_enabled,created_at,updated_at) VALUES(?,?, 'ANALOG_OUTPUT','EBYTE ME31-XXXA0006','ebyte-me31-xxxa0006-v1.1',1,?,?)",(node_id,node_id,now,now))
+            store.run("UPDATE nodes SET archived_at=?,polling_enabled=0 WHERE id='archived-ao'",(now,))
+            store.run("INSERT INTO polling_items(id,node_id,profile_id,register_name,function_code,address,quantity,data_type,interval_ms,timeout_ms,retries,scale,unit,enabled,last_value,created_at,updated_at) VALUES('existing','active-ao','ebyte-me31-xxxa0006-v1.1','AO setpoint readback',3,100,6,'uint16_array',7500,4000,2,0.001,'mA',0,'prior-value',?,?)",(now,now))
+            store.run("DELETE FROM schema_migrations WHERE version=15")
+            store.close()
+            migrated=Store(str(path))
+            try:
+                preserved=migrated.one("SELECT interval_ms,timeout_ms,retries,enabled,last_value FROM polling_items WHERE id='existing'")
+                self.assertEqual(preserved,{"interval_ms":7500,"timeout_ms":4000,"retries":2,"enabled":0,"last_value":"prior-value"})
+                active=migrated.rows("SELECT register_name FROM polling_items WHERE node_id='active-ao'")
+                self.assertEqual({row["register_name"] for row in active},{"AO setpoint readback","AO output ranges"})
+                self.assertEqual(migrated.one("SELECT COUNT(*) count FROM polling_items WHERE node_id='archived-ao'")["count"],0)
+            finally:
+                migrated.close()
 
     def test_migration_7_allows_multiple_enabled_disarmed_pipeline_definitions(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -112,7 +140,7 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             store.run("UPDATE nodes SET polling_enabled=1 WHERE id='archived-ai'")
         reopened = Store(":memory:")
-        self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],14)
+        self.assertEqual(reopened.one("SELECT MAX(version) version FROM schema_migrations")["version"],15)
         store.close(); reopened.close()
 
     def test_retention_cleanup_keeps_archived_node_history(self):

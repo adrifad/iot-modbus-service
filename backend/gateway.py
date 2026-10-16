@@ -7,8 +7,9 @@ import socket
 import time
 from dataclasses import dataclass, field
 
-from .modbus import (ModbusError, StreamFrames, build_me31_ao_write_request,
-                     build_request, decode_response, decode_write_ack)
+from .modbus import (ModbusError, StreamFrames, build_me31_ao_range_request,
+                     build_me31_ao_write_request, build_request, decode_response,
+                     decode_write_ack, decode_write_single_ack)
 
 
 class TransportDesynchronized(ConnectionError):
@@ -267,6 +268,115 @@ class GatewaySession:
                 self.transport_mode, frame, unit_id=unit_id, function_code=function_code,
                 quantity=quantity, transaction_id=tx)
             return await self._wait_transaction_locked(unit_id, function_code, request, timeout_ms, decoder)
+
+    async def configure_me31_output_range(self, unit_id, channel, range_code, timeout_ms):
+        """Atomically inspect, FC06-write, and verify one ME31 AO range."""
+        if self.transport_mode != "TRANSPARENT_SERIAL":
+            raise ValueError("ME31 output range configuration requires transparent RTU-over-TCP framing")
+        if channel not in range(1, 7) or range_code not in (0, 1) or isinstance(range_code, bool):
+            raise ValueError("invalid ME31 output channel or range code")
+        if self.desynchronized:
+            raise TransportDesynchronized("RTU stream is desynchronized; reconnect and recommission gateway")
+        if self.closed or not self.commissioned:
+            raise ConnectionError("gateway session is not commissioned or connected")
+        address = 0x0513 + channel
+
+        async with self.lock:
+            async def read_block(start_address, quantity):
+                tx = secrets.randbelow(65536)
+                request = build_request(self.transport_mode, unit_id, 3, start_address, quantity, tx)
+                decoder = lambda frame, transaction: decode_response(
+                    self.transport_mode, frame, unit_id=unit_id, function_code=3,
+                    quantity=quantity, transaction_id=transaction)
+                try:
+                    values, frame, sent, latency = await self._wait_transaction_locked(unit_id, 3, request, timeout_ms, decoder)
+                except Exception as exc:
+                    try:
+                        exc.range_read_trace = {"read_request": request,
+                                                "read_response": getattr(exc, "modbus_frame", None),
+                                                "read_latency_ms": getattr(exc, "modbus_latency_ms", None),
+                                                "read_address": start_address}
+                    except Exception:
+                        pass
+                    raise
+                return values, frame, sent, latency
+
+            before_ranges, ranges_frame, ranges_request, ranges_latency = await read_block(0x0514, 6)
+            setpoints, setpoints_frame, setpoints_request, setpoints_latency = await read_block(0x0064, 6)
+            current_code = before_ranges[channel - 1]
+            current_setpoint_ma = setpoints[channel - 1] / 1000.0
+            minimum = 0.0 if range_code == 0 else 4.0
+            if not minimum <= current_setpoint_ma <= 20.0:
+                raise ValueError(
+                    f"AO{channel} reported setpoint {current_setpoint_ma:.3f} mA is incompatible with the requested range"
+                )
+            if current_code == range_code:
+                return {
+                    "changed": False, "channel": channel, "previous_range_code": current_code,
+                    "range_code": range_code, "reported_setpoint_ma": current_setpoint_ma,
+                    "ranges_request": ranges_request, "ranges_response": ranges_frame,
+                    "setpoints_request": setpoints_request, "setpoints_response": setpoints_frame,
+                    "write_request": None, "acknowledgement": None, "verified_ranges_request": None,
+                    "verified_ranges_response": None, "range_latency_ms": ranges_latency,
+                    "setpoint_latency_ms": setpoints_latency, "write_latency_ms": None,
+                    "verify_latency_ms": None,
+                }
+
+            transaction_id = secrets.randbelow(65536)
+            request = build_me31_ao_range_request(self.transport_mode, unit_id, channel, range_code, transaction_id)
+            decoder = lambda frame, transaction: decode_write_single_ack(
+                self.transport_mode, frame, unit_id=unit_id, address=address,
+                value=range_code, transaction_id=transaction)
+            try:
+                _, acknowledgement, sent, write_latency = await self._wait_transaction_locked(
+                    unit_id, 6, request, timeout_ms, decoder)
+            except Exception as exc:
+                try:
+                    exc.range_write_started = True
+                    exc.trace = {"write_request": request,
+                                 "acknowledgement": getattr(exc, "modbus_frame", None),
+                                 "write_latency_ms": getattr(exc, "modbus_latency_ms", None),
+                                 "ranges_request": ranges_request, "ranges_response": ranges_frame,
+                                 "setpoints_request": setpoints_request, "setpoints_response": setpoints_frame,
+                                 "acknowledged": False, "previous_range_code": current_code,
+                                 "reported_setpoint_ma": current_setpoint_ma}
+                except Exception:
+                    pass
+                raise
+            try:
+                verified, verified_frame, verified_request, verify_latency = await read_block(0x0514, 6)
+            except Exception as exc:
+                raise OutputReadbackError(
+                    f"AO{channel} range write was acknowledged but FC03 verification failed: {exc}",
+                    {"write_request": sent, "acknowledgement": acknowledgement,
+                     "ranges_request": ranges_request, "ranges_response": ranges_frame,
+                     "setpoints_request": setpoints_request, "setpoints_response": setpoints_frame,
+                     **getattr(exc, "range_read_trace", {}),
+                     "write_latency_ms": write_latency, "acknowledged": True,
+                     "previous_range_code": current_code,
+                     "reported_setpoint_ma": current_setpoint_ma},
+                ) from exc
+            if verified[channel - 1] != range_code:
+                raise OutputReadbackError(
+                    f"AO{channel} range readback mismatch: requested {range_code}, device reports {verified[channel - 1]}",
+                    {"write_request": sent, "acknowledgement": acknowledgement,
+                     "ranges_request": ranges_request, "ranges_response": ranges_frame,
+                     "setpoints_request": setpoints_request, "setpoints_response": setpoints_frame,
+                     "write_latency_ms": write_latency, "readback_request": verified_request,
+                     "readback_frame": verified_frame, "readback_latency_ms": verify_latency,
+                     "acknowledged": True, "previous_range_code": current_code,
+                     "reported_setpoint_ma": current_setpoint_ma},
+                )
+            return {
+                "changed": True, "channel": channel, "previous_range_code": current_code,
+                "range_code": range_code, "reported_setpoint_ma": current_setpoint_ma,
+                "ranges_request": ranges_request, "ranges_response": ranges_frame,
+                "setpoints_request": setpoints_request, "setpoints_response": setpoints_frame,
+                "write_request": sent, "acknowledgement": acknowledgement,
+                "verified_ranges_request": verified_request, "verified_ranges_response": verified_frame,
+                "range_latency_ms": ranges_latency, "setpoint_latency_ms": setpoints_latency,
+                "write_latency_ms": write_latency, "verify_latency_ms": verify_latency,
+            }
 
     async def write_me31_output_and_readback(self, unit_id, channel, value_ma, write_timeout_ms, readback_timeout_ms=None):
         """Serialize the allowlisted FC16 output write and FC03 setpoint readback."""

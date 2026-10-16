@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+from uuid import uuid4
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
@@ -11,6 +12,34 @@ from datetime import datetime, timezone
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def insert_default_ao_polling(db, node_id: str, now: str) -> None:
+    """Insert missing built-in AO read items without changing existing choices."""
+    from .profiles import ME31_OUTPUT
+
+    for definition in ME31_OUTPUT["registers"]:
+        if not definition.get("polling_safe") or not definition.get("default_enabled"):
+            continue
+        exists = db.execute(
+            "SELECT 1 FROM polling_items WHERE node_id=? AND profile_id=? AND register_name=? LIMIT 1",
+            (node_id, ME31_OUTPUT["id"], definition["name"]),
+        ).fetchone()
+        if exists:
+            continue
+        db.execute(
+            """INSERT INTO polling_items(
+                id,node_id,profile_id,register_name,function_code,address,quantity,data_type,
+                byte_order,word_order,interval_ms,timeout_ms,retries,scale,unit,
+                measurement_metadata_json,float_verified,enabled,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(uuid4()), node_id, ME31_OUTPUT["id"], definition["name"],
+             definition["function_code"], definition["address"], definition["quantity"],
+             definition["data_type"], definition.get("byte_order", "big"),
+             definition.get("word_order", "unverified"), definition["default_interval_ms"],
+             5000, 1, definition.get("scale", 1), definition.get("unit", ""),
+             json.dumps(definition.get("measurement", {})), 0, 1, now, now),
+        )
 
 
 class Store:
@@ -342,6 +371,29 @@ class Store:
                 BEGIN SELECT RAISE(ABORT, 'archived nodes cannot receive output commands'); END;
             """)
             self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(14,?)", (utc_now(),))
+            migration = 14
+        if migration < 15:
+            now = utc_now()
+            self.db.execute("""CREATE TABLE IF NOT EXISTS output_range_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                channel INTEGER NOT NULL CHECK(channel BETWEEN 1 AND 6),
+                previous_range_code INTEGER,
+                requested_range_code INTEGER NOT NULL CHECK(requested_range_code IN (0,1)),
+                result TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                latency_ms REAL,
+                request_hex TEXT,
+                response_hex TEXT
+            )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS output_range_changes_node_time ON output_range_changes(node_id,channel,at DESC)")
+            active_outputs = self.db.execute(
+                "SELECT id FROM nodes WHERE node_type='ANALOG_OUTPUT' AND profile_id='ebyte-me31-xxxa0006-v1.1' AND archived_at IS NULL"
+            ).fetchall()
+            for node in active_outputs:
+                insert_default_ao_polling(self.db, node["id"], now)
+            self.db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(15,?)", (now,))
         from .profiles import PROFILES
         for profile in PROFILES:
             self.db.execute("INSERT OR IGNORE INTO device_profiles(id,name,definition_json,created_at) VALUES(?,?,?,?)",

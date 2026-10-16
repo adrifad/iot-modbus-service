@@ -87,8 +87,11 @@ ME31_OUTPUT = {
             "default_interval_ms": 30000,
             "channel_indices": [1, 2, 3, 4, 5, 6],
             "readable": True,
-            "writable": False,
+            "writable": True,
             "polling_safe": True,
+            "write_functions": [6, 16],
+            "channel_write_address_offset": 0,
+            "default_enabled": True,
         },
         {
             "name": "AO setpoint readback",
@@ -104,6 +107,7 @@ ME31_OUTPUT = {
             "readable": True,
             "writable": False,
             "polling_safe": True,
+            "default_enabled": True,
             "description": "Reported setpoint in microampere; this is not a physical current measurement.",
         },
         *[

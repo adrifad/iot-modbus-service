@@ -4,6 +4,7 @@ import asyncio
 import math
 
 from .gateway import OutputReadbackError
+from .modbus import ModbusExceptionResponse
 from .node_lifecycle import NodeOperationError, NodeOperationGate
 from .store import utc_now
 
@@ -234,6 +235,142 @@ class OutputDriver:
                              **event_context)
             return {"channel": channel, "requested_ma": requested, "acknowledged_ma": readback,
                     "status": status, "updated_at": now, "request_hex": request_hex, "response_hex": response_hex}
+
+    async def set_output_range(self, node_id: str, channel: int, range_code: int, *, confirm: bool):
+        """Set one documented AO range with FC06 and require a block readback."""
+        if not confirm:
+            raise OutputError("Explicit operator confirmation is required before changing a physical AO range")
+        if channel not in range(1, 7):
+            raise OutputError("Output channel must be AO1–AO6")
+        if isinstance(range_code, bool) or range_code not in (0, 1):
+            raise OutputError("Output range code must be 0 (0–20 mA) or 1 (4–20 mA)")
+        try:
+            async with self.operations.operation(node_id):
+                return await self._set_output_range(node_id, channel, range_code)
+        except NodeOperationError as exc:
+            raise OutputError(str(exc)) from exc
+
+    async def _set_output_range(self, node_id: str, channel: int, range_code: int):
+        node = self._node(node_id)
+        if not node["polling_enabled"]:
+            raise OutputError("Output node is disabled")
+        channel_row = self.store.one(
+            "SELECT enabled FROM channels WHERE node_id=? AND channel_index=? AND channel_type='ANALOG_OUTPUT'",
+            (node_id, channel),
+        )
+        if not channel_row or not channel_row["enabled"]:
+            raise OutputError("Output channel is missing or disabled")
+        timeout_ms = self.timeout_ms("output_range_timeout_ms")
+        async with self.lock_for(node_id, channel):
+            owners = self.store.rows(
+                "SELECT id,name FROM mappings WHERE destination_node_id=? AND destination_channel=? AND enabled=1 AND armed=1",
+                (node_id, channel),
+            )
+            if owners:
+                raise OutputError("Output range is locked while an armed pipeline owns this AO channel")
+            session = self._session(node)
+            if session.transport_mode != "TRANSPARENT_SERIAL":
+                raise OutputError("ME31 output range configuration requires transparent RTU-over-TCP framing")
+            started = False
+            result = None
+            try:
+                # This session method holds the gateway lock across pre-reads,
+                # FC06, and verification. It cannot interleave with polling,
+                # manual writes, pipelines, or gateway health probes.
+                result = await session.configure_me31_output_range(node["slave_id"], channel, range_code, timeout_ms)
+                started = bool(result["changed"])
+                status = "NO_CHANGE" if not result["changed"] else "ACKNOWLEDGED"
+                detail = (f"AO{channel} already used range code {range_code}" if not result["changed"] else
+                          f"FC06 acknowledged and FC03 range readback confirmed code {range_code}")
+            except BaseException as exc:
+                if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                    raise
+                trace = getattr(exc, "trace", getattr(exc, "range_read_trace", {}))
+                started = bool(getattr(exc, "range_write_started", False) or trace.get("write_request"))
+                previous = trace.get("previous_range_code")
+                if isinstance(exc, OutputReadbackError):
+                    trace = exc.trace
+                request_hex = " | ".join(frame.hex(" ") for frame in
+                    (trace.get("ranges_request"), trace.get("setpoints_request"), trace.get("write_request"),
+                     trace.get("read_request"), trace.get("readback_request")) if frame) or None
+                response_hex = " | ".join(frame.hex(" ") for frame in
+                    (trace.get("ranges_response"), trace.get("setpoints_response"), trace.get("acknowledgement"),
+                     trace.get("read_response"), trace.get("readback_frame")) if frame) or None
+                if isinstance(exc, OutputReadbackError) and "mismatch" in str(exc).lower():
+                    status = "RANGE_READBACK_MISMATCH"
+                elif isinstance(exc, OutputReadbackError):
+                    status = "RANGE_READBACK_FAILED"
+                elif isinstance(exc, ValueError):
+                    status = "RANGE_PRECONDITION_FAILED"
+                elif (getattr(exc, "range_write_started", False)
+                      and not isinstance(exc, (ModbusExceptionResponse, OutputReadbackError))):
+                    status = "RANGE_WRITE_OUTCOME_UNKNOWN"
+                elif isinstance(exc, ModbusExceptionResponse):
+                    status = "MODBUS_ERROR"
+                else:
+                    status = "FAILED"
+                detail = str(exc)
+                self._record_range(node_id, channel, previous, range_code, status, detail,
+                                   getattr(exc, "modbus_latency_ms", trace.get("read_latency_ms")), request_hex, response_hex)
+                self.store.event(status, detail, gateway_id=node["gateway_id"], node_id=node_id,
+                                 direction="TX" if started else "VALIDATION", protocol="TRANSPARENT_SERIAL",
+                                 function_code=6 if started else None, address=0x0513 + channel,
+                                 quantity=1 if started else None, latency_ms=getattr(exc, "modbus_latency_ms", trace.get("read_latency_ms")),
+                                 request_hex=request_hex, response_hex=response_hex)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if isinstance(exc, ValueError):
+                    raise OutputError(str(exc)) from exc
+                raise
+
+            request_hex = " | ".join(frame.hex(" ") for frame in
+                (result.get("ranges_request"), result.get("setpoints_request"), result.get("write_request"),
+                 result.get("verified_ranges_request")) if frame) or None
+            response_hex = " | ".join(frame.hex(" ") for frame in
+                (result.get("ranges_response"), result.get("setpoints_response"), result.get("acknowledgement"),
+                 result.get("verified_ranges_response")) if frame) or None
+            latency = result.get("write_latency_ms") or result.get("verify_latency_ms")
+            self._record_range(node_id, channel, result["previous_range_code"], range_code,
+                               status, detail, latency, request_hex, response_hex)
+            event_result = "OUTPUT_RANGE_CHANGE_ACKNOWLEDGED" if result["changed"] else "NO_CHANGE"
+            self.store.event(event_result, detail, gateway_id=node["gateway_id"], node_id=node_id,
+                             direction="TX" if result["changed"] else "READ",
+                             protocol="TRANSPARENT_SERIAL", function_code=6 if result["changed"] else 3,
+                             address=0x0513 + channel if result["changed"] else 0x0514,
+                             quantity=1 if result["changed"] else 6, latency_ms=latency,
+                             request_hex=request_hex, response_hex=response_hex)
+            # Update only the validated readback cache. This remains a register
+            # report, not proof of physical current or power-cycle persistence.
+            if result["changed"]:
+                item = self.store.one("SELECT id,last_value FROM polling_items WHERE node_id=? AND profile_id=? AND register_name='AO output ranges'",
+                    (node_id, "ebyte-me31-xxxa0006-v1.1"))
+                if item:
+                    import json
+                    try:
+                        value = json.loads(item["last_value"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        value = {}
+                    raw_registers = value.get("raw_registers")
+                    if isinstance(raw_registers, list) and len(raw_registers) == 6:
+                        raw_registers[channel - 1] = range_code
+                        value["output_ranges"] = [
+                            {"raw_value": raw, "label": {0: "0–20 mA", 1: "4–20 mA"}.get(raw, "UNKNOWN"),
+                             "quality": "GOOD" if raw in (0, 1) else "UNKNOWN"}
+                            for raw in raw_registers
+                        ]
+                        self.store.run("UPDATE polling_items SET last_value=?,last_success_at=?,last_status='GOOD',updated_at=? WHERE id=?",
+                                       (json.dumps(value), utc_now(), utc_now(), item["id"]))
+            return {"channel": channel, "range_code": range_code,
+                    "range_label": "0–20 mA" if range_code == 0 else "4–20 mA",
+                    "previous_range_code": result["previous_range_code"], "changed": result["changed"],
+                    "reported_setpoint_ma": result["reported_setpoint_ma"], "status": status,
+                    "updated_at": utc_now(), "request_hex": request_hex, "response_hex": response_hex,
+                    "latency_ms": latency}
+
+    def _record_range(self, node_id, channel, previous, requested, result, detail, latency_ms, request_hex, response_hex):
+        self.store.run("""INSERT INTO output_range_changes(at,node_id,channel,previous_range_code,requested_range_code,
+            result,detail,latency_ms,request_hex,response_hex) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (utc_now(), node_id, channel, previous, requested, result, detail, latency_ms, request_hex, response_hex))
 
     def _record(self, node_id, channel, source, target, readback, result, detail, request_hex, response_hex, *, pipeline_id=None, classification="MANUAL"):
         self.store.run("""INSERT INTO output_commands(at,node_id,channel,source,target_ma,readback_ma,result,detail,request_hex,response_hex,pipeline_id,classification)

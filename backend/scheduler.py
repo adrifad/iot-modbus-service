@@ -123,21 +123,32 @@ class PollScheduler:
                     continue
                 if now_mono < self.due.get(item_id, 0):
                     continue
-                self.due[item_id] = now_mono + interval / 1000
                 due_items.append(item)
 
-            for group in self._batch_due_items(due_items):
-                if group[0].get("node_type") == "ANALOG_OUTPUT":
-                    pending = self.output_gateway_tasks.get(group[0]["gateway_id"])
-                    if pending and not pending.done():
-                        # The item's next due time was already advanced; a
-                        # missed interval is skipped instead of queued.
+            groups = self._batch_due_items(due_items)
+            # A shared RTU stream can dispatch one low-priority poll at a time.
+            # Oldest-due-first prevents an address/name sort from repeatedly
+            # starving the slower output-range read behind setpoint polling.
+            groups.sort(key=lambda group: min(self.due.get(item["id"], now_mono) for item in group))
+            dispatched_output_gateways = set()
+            for group in groups:
+                is_output = group[0].get("node_type") == "ANALOG_OUTPUT"
+                if is_output:
+                    gateway_id = group[0]["gateway_id"]
+                    pending = self.output_gateway_tasks.get(gateway_id)
+                    if ((pending and not pending.done()) or gateway_id in dispatched_output_gateways):
+                        # Keep the due timestamp. Once the current RTU exchange
+                        # drains, the oldest overdue item gets the next turn.
                         continue
                 task = asyncio.create_task(self._poll_group(group), name=f"poll-{group[0]['id']}")
                 for item in group:
                     self.tasks[item["id"]] = task
-                if group[0].get("node_type") == "ANALOG_OUTPUT":
+                    interval = int(item["interval_ms"])
+                    # Skip missed cycles instead of replaying a stale backlog.
+                    self.due[item["id"]] = now_mono + max(0.25, interval / 1000)
+                if is_output:
                     self.output_gateway_tasks[group[0]["gateway_id"]] = task
+                    dispatched_output_gateways.add(group[0]["gateway_id"])
             await asyncio.sleep(0.1)
 
     def _cleanup_retention(self):
@@ -217,7 +228,7 @@ class PollScheduler:
                 if len(items) != 1:
                     raise ValueError("output register blocks cannot be combined with other polling items")
                 definition = register(first["profile_id"], first["register_name"])
-                if (not definition or not definition.get("polling_safe") or definition.get("writable")
+                if (not definition or not definition.get("polling_safe")
                         or definition.get("function_code") != first["function_code"]
                         or definition.get("address") != first["address"]
                         or definition.get("quantity") != first["quantity"]

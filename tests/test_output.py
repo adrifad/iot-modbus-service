@@ -3,7 +3,7 @@ import struct
 import unittest
 from uuid import uuid4
 
-from backend.gateway import GatewaySession
+from backend.gateway import GatewaySession, OutputReadbackError
 from backend.modbus import with_crc
 from backend.output import OutputDriver, OutputError, OutputOutcomeUnknown
 from backend.store import Store, utc_now
@@ -22,8 +22,11 @@ class OutputDriverIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.ranges = ranges or [0] * 6
         self.setpoints = [0] * 6
         self.write_requests = []
+        self.range_write_requests = []
         self.ignore_writes = False
         self.drop_write_ack = False
+        self.ignore_range_writes = False
+        self.drop_range_ack = False
 
         async def simulated_me31(reader, writer):
             try:
@@ -55,6 +58,18 @@ class OutputDriverIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             self.setpoints[channel] = round(current * 1000)
                         if not self.drop_write_ack:
                             writer.write(with_crc(prefix[:1] + bytes((16,)) + request[2:6]))
+                    elif function == 6:
+                        rest = await reader.readexactly(6)
+                        request = prefix + rest
+                        self.range_write_requests.append(request)
+                        address = int.from_bytes(request[2:4], "big")
+                        value = int.from_bytes(request[4:6], "big")
+                        if address not in range(0x0514, 0x051A) or value not in (0, 1):
+                            raise AssertionError(f"unexpected AO range write {request.hex()}")
+                        if not self.ignore_range_writes:
+                            self.ranges[address - 0x0514] = value
+                        if not self.drop_range_ack:
+                            writer.write(with_crc(prefix[:1] + bytes((6,)) + request[2:6]))
                     else:
                         raise AssertionError(f"unexpected function {function}")
                     await writer.drain()
@@ -166,6 +181,65 @@ class OutputDriverIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(OutputError, "armed pipeline owns"):
             await self.driver.set_output(self.node_id, 1, 10, source="MANUAL:test")
         self.assertEqual(self.write_requests, [])
+
+    async def test_range_fc06_ao1_and_ao6_each_confirmed_by_fc03(self):
+        await self._device()
+        self.setpoints[0] = 12000
+        self.setpoints[5] = 12000
+        first = await self.driver.set_output_range(self.node_id, 1, 1, confirm=True)
+        sixth = await self.driver.set_output_range(self.node_id, 6, 1, confirm=True)
+        self.assertEqual(first["status"], "ACKNOWLEDGED")
+        self.assertEqual(sixth["status"], "ACKNOWLEDGED")
+        self.assertEqual(self.range_write_requests[0][:6], bytes.fromhex("01 06 05 14 00 01"))
+        self.assertEqual(self.range_write_requests[1][:6], bytes.fromhex("01 06 05 19 00 01"))
+        self.assertEqual(self.ranges[0], 1)
+        self.assertEqual(self.ranges[5], 1)
+        self.assertEqual(self.store.one("SELECT COUNT(*) count FROM output_range_changes WHERE result='ACKNOWLEDGED'")["count"], 2)
+        self.assertEqual(self.store.one("SELECT result FROM events WHERE result='OUTPUT_RANGE_CHANGE_ACKNOWLEDGED' ORDER BY id DESC LIMIT 1")["result"], "OUTPUT_RANGE_CHANGE_ACKNOWLEDGED")
+
+    async def test_range_change_rejects_incompatible_setpoint_without_fc06(self):
+        await self._device()
+        self.setpoints[0] = 3000
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            await self.driver.set_output_range(self.node_id, 1, 1, confirm=True)
+        self.assertEqual(self.range_write_requests, [])
+        self.assertEqual(self.ranges[0], 0)
+
+    async def test_range_change_requires_confirmation_and_rejects_armed_pipeline(self):
+        await self._device()
+        with self.assertRaisesRegex(OutputError, "confirmation"):
+            await self.driver.set_output_range(self.node_id, 1, 0, confirm=False)
+        now = utc_now()
+        self.store.run("INSERT INTO gateways(id,name,transport_mode,created_at,updated_at) VALUES(?,?,?,?,?)", ("source-gateway", "Input gateway", "MODBUS_TCP", now, now))
+        self.store.run("INSERT INTO nodes(id,name,node_type,hardware_model,gateway_id,slave_id,profile_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       ("source-node", "AI", "ANALOG_INPUT", "EBYTE ME31-XAXX0600", "source-gateway", 1, "ebyte-me31-xaxx0600-v1.1", now, now))
+        self.store.run("INSERT INTO mappings(id,name,source_node_id,source_channel,destination_node_id,destination_channel,source_value_type,config_json,enabled,status,armed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,'RUNNING',1,?,?)",
+                       ("pipeline-range-lock", "AI1 to AO1", "source-node", 1, self.node_id, 1, "CALIBRATED_MA", "{}", now, now))
+        with self.assertRaisesRegex(OutputError, "armed pipeline"):
+            await self.driver.set_output_range(self.node_id, 1, 1, confirm=True)
+        self.assertEqual(self.range_write_requests, [])
+
+    async def test_range_fc06_timeout_is_unknown_and_never_blindly_retried(self):
+        await self._device()
+        self.setpoints[0] = 12000
+        self.store.set_setting("output_range_timeout_ms", "250")
+        self.drop_range_ack = True
+        with self.assertRaises(TimeoutError):
+            await self.driver.set_output_range(self.node_id, 1, 1, confirm=True)
+        self.assertEqual(len(self.range_write_requests), 1)
+        self.assertTrue(self.session.desynchronized)
+        row = self.store.one("SELECT result FROM output_range_changes WHERE node_id=?", (self.node_id,))
+        self.assertEqual(row["result"], "RANGE_WRITE_OUTCOME_UNKNOWN")
+
+    async def test_fc06_ack_without_range_readback_is_not_reported_as_success(self):
+        await self._device()
+        self.setpoints[0] = 12000
+        self.ignore_range_writes = True
+        with self.assertRaisesRegex(OutputReadbackError, "mismatch"):
+            await self.driver.set_output_range(self.node_id, 1, 1, confirm=True)
+        self.assertEqual(len(self.range_write_requests), 1)
+        row = self.store.one("SELECT result FROM output_range_changes WHERE node_id=?", (self.node_id,))
+        self.assertEqual(row["result"], "RANGE_READBACK_MISMATCH")
 
 
 if __name__ == "__main__":
